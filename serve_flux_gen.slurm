@@ -36,6 +36,12 @@ PORT=8768
 export PORT=$PORT
 export HF_HOME=/scratch/users/t07an25/llm_experiments/hf_cache
 
+# HF auth — Flux.1 schnell is a gated repo even though it's Apache 2.0.
+# Reads the token written by `huggingface-cli login` (or `hf auth login`).
+if [ -f "$HOME/.huggingface/token" ]; then
+    export HF_TOKEN=$(cat "$HOME/.huggingface/token")
+fi
+
 echo "============================================================"
 echo "  Flux.1 schnell  |  Node: ${NODE}  |  Port: ${PORT}"
 echo "  Chat app can reach it at: http://${NODE}:${PORT}"

@@ -47,9 +47,13 @@ def _load_model():
         cache_dir=CACHE_DIR,
     )
 
-    # Sequential CPU offload keeps peak VRAM low (text encoders + VAE stream
-    # in/out as needed). Slower but fits comfortably in a 20 GB MIG slice.
-    pipe.enable_model_cpu_offload()
+    # Flux transformer alone is ~24 GB in bf16 — too big for a 20 GB MIG slice.
+    # Sequential CPU offload streams individual layers between CPU and GPU,
+    # keeping peak VRAM under ~8 GB. ~30-60 sec per image but no OOM.
+    pipe.enable_sequential_cpu_offload()
+    # VAE tiling cuts the decode-time VRAM spike on 1024×1024.
+    if hasattr(pipe, "vae") and pipe.vae is not None:
+        pipe.vae.enable_tiling()
     pipe.set_progress_bar_config(disable=True)
 
     _pipe = pipe
