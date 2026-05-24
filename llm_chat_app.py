@@ -19,6 +19,15 @@ MODEL_PATH   = os.environ.get("MODEL_PATH",   "/scratch/users/t07an25/llm_experi
 WHISPER_PATH = os.environ.get("WHISPER_PATH", "/scratch/users/t07an25/llm_experiments/whisper")
 PORT         = int(os.environ.get("PORT", 8766))
 
+# System prompt prepended to every conversation. Override at runtime with
+# the SYSTEM_PROMPT env var (e.g. in serve_llm.slurm) or edit the default below.
+SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT", (
+    "You are Gemma, a helpful, concise multimodal assistant. "
+    "You can see images and read transcripts of audio. "
+    "Format answers in clean Markdown — use headings, bullet lists and code blocks where useful. "
+    "If you are unsure, say so."
+))
+
 # Long transcripts are split into chunks; each chunk is summarised individually,
 # then the summaries are combined for the final Gemma 4 response.
 CHUNK_WORDS           = 900   # words per chunk sent to Gemma 4
@@ -559,7 +568,10 @@ async def chat(
             trimmed = trimmed[-MAX_HISTORY_TURNS * 2:]
             print(f"[history] trimmed {dropped} old messages (kept last {len(trimmed)})", flush=True)
 
-        msgs = [{"role": t.get("role", "user"), "content": t.get("content", [])} for t in trimmed]
+        msgs = []
+        if SYSTEM_PROMPT:
+            msgs.append({"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]})
+        msgs.extend({"role": t.get("role", "user"), "content": t.get("content", [])} for t in trimmed)
         msgs.append({"role": "user", "content": content})
 
         # Token-budget guard: if the prompt is still huge after history trim,
