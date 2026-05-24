@@ -23,6 +23,10 @@ export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=2
 export MKL_NUM_THREADS=1
 
+# Reduce VRAM fragmentation — lets large allocations succeed even when
+# free memory is scattered. Cheap, effective against intermittent OOMs.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
+
 MIG_UUID=$(nvidia-smi -L 2>/dev/null | grep -oP 'MIG-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}' | head -1)
 if [ -n "$MIG_UUID" ]; then
     export CUDA_VISIBLE_DEVICES=$MIG_UUID

@@ -24,6 +24,11 @@ PORT         = int(os.environ.get("PORT", 8766))
 CHUNK_WORDS           = 900   # words per chunk sent to Gemma 4
 LONG_TRANSCRIPT_WORDS = 1200  # transcripts longer than this use chunked mode
 
+# OOM controls.
+MAX_HISTORY_TURNS     = 6     # keep last N user+model exchanges (12 messages total)
+MAX_IMAGE_EDGE        = 896   # downscale images so longest edge ≤ this
+MAX_INPUT_TOKENS_SOFT = 6000  # if prompt exceeds this, drop oldest history
+
 app = FastAPI(title="Gemma 4 Chat")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -492,6 +497,10 @@ async def chat(
         content = []
         if image_bytes:
             pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            # Downscale to keep vision-tower KV cache manageable
+            if max(pil_img.size) > MAX_IMAGE_EDGE:
+                pil_img.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE), Image.LANCZOS)
+                print(f"[image] downscaled to {pil_img.size}", flush=True)
             content.append({"type": "image", "image": pil_img})
 
         context_text = ""
@@ -542,8 +551,27 @@ async def chat(
             yield f'data: {json.dumps({"done": True})}\n\n'
             return
 
+        # Trim history: keep last MAX_HISTORY_TURNS user+model pairs
+        if len(hist) > MAX_HISTORY_TURNS * 2:
+            dropped = len(hist) - MAX_HISTORY_TURNS * 2
+            hist = hist[-MAX_HISTORY_TURNS * 2:]
+            print(f"[history] trimmed {dropped} old messages (kept last {len(hist)})", flush=True)
+
         msgs = [{"role": t.get("role", "user"), "content": t.get("content", [])} for t in hist]
         msgs.append({"role": "user", "content": content})
+
+        # Token-budget guard: if the prompt is still huge after history trim,
+        # drop more old messages until we fit (preserves system context + current turn).
+        def _prompt_tokens(m):
+            try:
+                ids = _processor.apply_chat_template(m, add_generation_prompt=True, tokenize=True, return_tensors="pt")
+                return ids.shape[-1]
+            except Exception:
+                return 0
+
+        while len(msgs) > 1 and _prompt_tokens(msgs) > MAX_INPUT_TOKENS_SOFT:
+            removed = msgs.pop(0)
+            print(f"[token-budget] dropped {removed.get('role')} message ({_prompt_tokens(msgs)} tokens remaining)", flush=True)
 
         # ── Step 3: stream Gemma 4 inference ─────────────────────────────────
         streamer = TextIteratorStreamer(
@@ -551,7 +579,7 @@ async def chat(
         )
         inference_error: list = []   # mutable container so the thread can write into it
 
-        def run_inference():
+        def run_inference(max_new_tokens=1024, retry=False):
             with _lock:
                 try:
                     inputs = _processor.apply_chat_template(
@@ -561,17 +589,21 @@ async def chat(
                     inputs = {k: v.to(_model.device) for k, v in inputs.items()}
                     _model.generate(
                         **inputs, streamer=streamer,
-                        max_new_tokens=1024, do_sample=True,
+                        max_new_tokens=max_new_tokens, do_sample=True,
                         temperature=0.7, top_p=0.9,
                     )
                 except torch.cuda.OutOfMemoryError as ex:
-                    inference_error.append(
-                        "GPU out of memory — the transcript or image is too large for the "
-                        "remaining VRAM. Try a shorter audio clip (under ~10 minutes) or a "
-                        "smaller image."
-                    )
                     print(f"[OOM] {ex}", flush=True)
                     torch.cuda.empty_cache()
+                    if not retry:
+                        print("[OOM] retrying with max_new_tokens=256", flush=True)
+                        # Recreate streamer for the retry attempt
+                        run_inference(max_new_tokens=256, retry=True)
+                    else:
+                        inference_error.append(
+                            "GPU out of memory even after retry. Try clearing the chat "
+                            "(refresh the page) and sending a shorter message or a smaller image."
+                        )
                 except Exception as ex:
                     inference_error.append(str(ex))
                     print(f"[inference error] {ex}", flush=True)
