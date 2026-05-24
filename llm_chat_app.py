@@ -20,8 +20,9 @@ MODEL_PATH   = os.environ.get("MODEL_PATH",   "/scratch/users/t07an25/llm_experi
 WHISPER_PATH = os.environ.get("WHISPER_PATH", "/scratch/users/t07an25/llm_experiments/whisper")
 PORT         = int(os.environ.get("PORT", 8766))
 
-# Image-generation service (separate SLURM job, separate MIG slice)
-IMAGE_GEN_URL = os.environ.get("IMAGE_GEN_URL", "http://gpu02:8767")
+# Image-generation services (separate SLURM jobs, separate MIG slices)
+IMAGE_GEN_URL = os.environ.get("IMAGE_GEN_URL", "http://gpu02:8767")   # SDXL Lightning
+FLUX_GEN_URL  = os.environ.get("FLUX_GEN_URL",  "http://gpu02:8768")   # Flux.1 schnell
 
 # System prompt prepended to every conversation. Override at runtime with
 # the SYSTEM_PROMPT env var (e.g. in serve_llm.slurm) or edit the default below.
@@ -205,7 +206,9 @@ HTML = r"""<!DOCTYPE html>
   <div id="welcome">
     <div class="big">✦</div>
     <h2>Gemma 4 Multimodal Chat</h2>
-    <p>Send text, upload images, transcribe audio — or type <code>/image &lt;prompt&gt;</code> to generate a picture.</p>
+    <p>Send text, upload images, transcribe audio.<br>
+       <code>/image &lt;prompt&gt;</code> — fast generation (SDXL Lightning).<br>
+       <code>/imageflux &lt;prompt&gt;</code> — higher quality, can render text (Flux.1 schnell).</p>
   </div>
 </div>
 
@@ -346,14 +349,15 @@ function appendTranscript(transcript) {
   chat.scrollTop = chat.scrollHeight;
 }
 
-function appendGeneratedImage(dataUrl, prompt) {
+function appendGeneratedImage(dataUrl, prompt, model) {
   const chat = document.getElementById('chat');
   const div = document.createElement('div');
   div.className = 'msg ai';
+  const modelLabel = model ? ` · ${esc(model)}` : '';
   div.innerHTML = `
     <div class="avatar">🎨</div>
     <div class="bubble">
-      <div style="font-size:.75rem;color:var(--text-dim);margin-bottom:6px;font-weight:600">🎨 Generated image</div>
+      <div style="font-size:.75rem;color:var(--text-dim);margin-bottom:6px;font-weight:600">🎨 Generated image${modelLabel}</div>
       <img src="${dataUrl}" alt="generated image" style="max-width:512px;width:100%;border-radius:8px;display:block">
       <div style="font-size:.78rem;color:var(--text-dim);margin-top:6px;font-style:italic">"${esc(prompt)}"</div>
     </div>`;
@@ -438,7 +442,7 @@ async function send() {
         }
         if (data.generated_image) {
           typingEl.remove();
-          appendGeneratedImage(data.generated_image, data.prompt);
+          appendGeneratedImage(data.generated_image, data.prompt, data.model);
           continue;
         }
         if (!aiTextEl) {
@@ -502,31 +506,42 @@ async def chat(
     async def stream_response():
         loop = asyncio.get_event_loop()
 
-        # ── /image slash command: forward to image-gen microservice ──────────
-        if msg_text.lower().startswith("/image "):
-            prompt = msg_text[len("/image "):].strip()
+        # ── /image and /imageflux slash commands ─────────────────────────────
+        # /image <prompt>      → SDXL Lightning (fast, lower quality)
+        # /imageflux <prompt>  → Flux.1 schnell (slower, better quality + text)
+        slash = None
+        if msg_text.lower().startswith("/imageflux "):
+            slash = ("flux",  FLUX_GEN_URL,  "Flux",          msg_text[len("/imageflux "):].strip())
+        elif msg_text.lower().startswith("/image "):
+            slash = ("sdxl",  IMAGE_GEN_URL, "SDXL Lightning", msg_text[len("/image "):].strip())
+
+        if slash is not None:
+            kind, base_url, label, prompt = slash
             if not prompt:
-                yield f'data: {json.dumps({"error": "Usage: /image <prompt>"})}\n\n'
+                cmd_name = "imageflux" if kind == "flux" else "image"
+                yield f'data: {json.dumps({"error": f"Usage: /{cmd_name} <prompt>"})}\n\n'
                 return
-            yield f'data: {json.dumps({"status": f"Generating image: {prompt[:60]}…"})}\n\n'
+            yield f'data: {json.dumps({"status": f"Generating with {label}: {prompt[:60]}…"})}\n\n'
             try:
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    r = await client.post(f"{IMAGE_GEN_URL}/generate", json={"prompt": prompt})
+                # Flux is slower (~6-10 sec) — give it a longer timeout
+                timeout = 300.0 if kind == "flux" else 120.0
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    r = await client.post(f"{base_url}/generate", json={"prompt": prompt})
                 if r.status_code != 200:
-                    yield f'data: {json.dumps({"error": f"Image service error: {r.text[:200]}"})}\n\n'
+                    yield f'data: {json.dumps({"error": f"{label} error: {r.text[:200]}"})}\n\n'
                     return
                 data = r.json()
                 if "error" in data:
                     yield f'data: {json.dumps({"error": data["error"]})}\n\n'
                     return
-                yield f'data: {json.dumps({"generated_image": data["image"], "prompt": prompt})}\n\n'
+                yield f'data: {json.dumps({"generated_image": data["image"], "prompt": prompt, "model": label})}\n\n'
                 yield f'data: {json.dumps({"done": True})}\n\n'
                 return
             except httpx.ConnectError:
-                yield f'data: {json.dumps({"error": f"Image-gen service unreachable at {IMAGE_GEN_URL}. Is the sdxl_gen SLURM job running?"})}\n\n'
+                yield f'data: {json.dumps({"error": f"{label} service unreachable at {base_url}. Is its SLURM job running?"})}\n\n'
                 return
             except Exception as ex:
-                yield f'data: {json.dumps({"error": f"Image generation failed: {ex}"})}\n\n'
+                yield f'data: {json.dumps({"error": f"{label} generation failed: {ex}"})}\n\n'
                 return
 
         # ── Step 1: transcribe audio non-blocking ─────────────────────────────
