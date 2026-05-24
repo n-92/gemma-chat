@@ -6,6 +6,7 @@ Run via serve_llm.slurm or: uvicorn llm_chat_app:app --port 8766
 import asyncio, base64, io, json, os, tempfile, threading
 from pathlib import Path
 
+import httpx
 import torch
 import uvicorn
 import whisper as _whisper_lib
@@ -18,6 +19,9 @@ from transformers import AutoProcessor, Gemma4ForConditionalGeneration, TextIter
 MODEL_PATH   = os.environ.get("MODEL_PATH",   "/scratch/users/t07an25/llm_experiments/gemma4")
 WHISPER_PATH = os.environ.get("WHISPER_PATH", "/scratch/users/t07an25/llm_experiments/whisper")
 PORT         = int(os.environ.get("PORT", 8766))
+
+# Image-generation service (separate SLURM job, separate MIG slice)
+IMAGE_GEN_URL = os.environ.get("IMAGE_GEN_URL", "http://gpu02:8767")
 
 # System prompt prepended to every conversation. Override at runtime with
 # the SYSTEM_PROMPT env var (e.g. in serve_llm.slurm) or edit the default below.
@@ -201,7 +205,7 @@ HTML = r"""<!DOCTYPE html>
   <div id="welcome">
     <div class="big">✦</div>
     <h2>Gemma 4 Multimodal Chat</h2>
-    <p>Send text, upload images — ask anything.</p>
+    <p>Send text, upload images, transcribe audio — or type <code>/image &lt;prompt&gt;</code> to generate a picture.</p>
   </div>
 </div>
 
@@ -342,6 +346,21 @@ function appendTranscript(transcript) {
   chat.scrollTop = chat.scrollHeight;
 }
 
+function appendGeneratedImage(dataUrl, prompt) {
+  const chat = document.getElementById('chat');
+  const div = document.createElement('div');
+  div.className = 'msg ai';
+  div.innerHTML = `
+    <div class="avatar">🎨</div>
+    <div class="bubble">
+      <div style="font-size:.75rem;color:var(--text-dim);margin-bottom:6px;font-weight:600">🎨 Generated image</div>
+      <img src="${dataUrl}" alt="generated image" style="max-width:512px;width:100%;border-radius:8px;display:block">
+      <div style="font-size:.78rem;color:var(--text-dim);margin-top:6px;font-style:italic">"${esc(prompt)}"</div>
+    </div>`;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
 function appendTyping() {
   const chat = document.getElementById('chat');
   const div = document.createElement('div');
@@ -417,6 +436,11 @@ async function send() {
           typingEl = appendTyping();
           continue;
         }
+        if (data.generated_image) {
+          typingEl.remove();
+          appendGeneratedImage(data.generated_image, data.prompt);
+          continue;
+        }
         if (!aiTextEl) {
           typingEl.remove();
           aiTextEl = appendMsg('ai', '', null, false);
@@ -477,6 +501,33 @@ async def chat(
 
     async def stream_response():
         loop = asyncio.get_event_loop()
+
+        # ── /image slash command: forward to image-gen microservice ──────────
+        if msg_text.lower().startswith("/image "):
+            prompt = msg_text[len("/image "):].strip()
+            if not prompt:
+                yield f'data: {json.dumps({"error": "Usage: /image <prompt>"})}\n\n'
+                return
+            yield f'data: {json.dumps({"status": f"Generating image: {prompt[:60]}…"})}\n\n'
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    r = await client.post(f"{IMAGE_GEN_URL}/generate", json={"prompt": prompt})
+                if r.status_code != 200:
+                    yield f'data: {json.dumps({"error": f"Image service error: {r.text[:200]}"})}\n\n'
+                    return
+                data = r.json()
+                if "error" in data:
+                    yield f'data: {json.dumps({"error": data["error"]})}\n\n'
+                    return
+                yield f'data: {json.dumps({"generated_image": data["image"], "prompt": prompt})}\n\n'
+                yield f'data: {json.dumps({"done": True})}\n\n'
+                return
+            except httpx.ConnectError:
+                yield f'data: {json.dumps({"error": f"Image-gen service unreachable at {IMAGE_GEN_URL}. Is the sdxl_gen SLURM job running?"})}\n\n'
+                return
+            except Exception as ex:
+                yield f'data: {json.dumps({"error": f"Image generation failed: {ex}"})}\n\n'
+                return
 
         # ── Step 1: transcribe audio non-blocking ─────────────────────────────
         transcript = None
