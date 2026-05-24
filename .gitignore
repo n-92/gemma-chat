@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Models — too large for git, downloaded separately (see README)
+gemma4/
+whisper/
+*.safetensors
+*.gguf
+*.pt
+*.bin
+
+# SLURM
+logs/
+*.out
+*.err
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local env
+.env
+.env.local
