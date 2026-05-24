@@ -551,13 +551,15 @@ async def chat(
             yield f'data: {json.dumps({"done": True})}\n\n'
             return
 
-        # Trim history: keep last MAX_HISTORY_TURNS user+model pairs
-        if len(hist) > MAX_HISTORY_TURNS * 2:
-            dropped = len(hist) - MAX_HISTORY_TURNS * 2
-            hist = hist[-MAX_HISTORY_TURNS * 2:]
-            print(f"[history] trimmed {dropped} old messages (kept last {len(hist)})", flush=True)
+        # Trim history: keep last MAX_HISTORY_TURNS user+model pairs.
+        # Use a local rebind to avoid Python's UnboundLocalError on `hist`.
+        trimmed = hist
+        if len(trimmed) > MAX_HISTORY_TURNS * 2:
+            dropped = len(trimmed) - MAX_HISTORY_TURNS * 2
+            trimmed = trimmed[-MAX_HISTORY_TURNS * 2:]
+            print(f"[history] trimmed {dropped} old messages (kept last {len(trimmed)})", flush=True)
 
-        msgs = [{"role": t.get("role", "user"), "content": t.get("content", [])} for t in hist]
+        msgs = [{"role": t.get("role", "user"), "content": t.get("content", [])} for t in trimmed]
         msgs.append({"role": "user", "content": content})
 
         # Token-budget guard: if the prompt is still huge after history trim,
