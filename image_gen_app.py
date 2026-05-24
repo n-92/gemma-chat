@@ -25,8 +25,8 @@ from safetensors.torch import load_file
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_MODEL    = os.environ.get("SDXL_BASE", "stabilityai/stable-diffusion-xl-base-1.0")
 LIGHTNING_REPO = "ByteDance/SDXL-Lightning"
-LIGHTNING_CKPT = "sdxl_lightning_4step_unet.safetensors"
-N_STEPS       = 4   # paired with sdxl_lightning_4step_unet.safetensors
+LIGHTNING_CKPT = "sdxl_lightning_8step_unet.safetensors"
+N_STEPS       = 8   # paired with sdxl_lightning_8step_unet.safetensors — better quality than 4-step
 PORT          = int(os.environ.get("PORT", 8767))
 CACHE_DIR     = os.environ.get("HF_HOME", "/scratch/users/t07an25/llm_experiments/hf_cache")
 
