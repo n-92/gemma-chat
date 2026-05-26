@@ -18,11 +18,12 @@ It runs locally on any Linux/Windows/macOS machine with a CUDA-capable GPU, and 
 8. [Running it on a SLURM HPC cluster](#running-it-on-a-slurm-hpc-cluster)
 9. [Using the chat UI](#using-the-chat-ui)
 10. [Image generation: SDXL Lightning and Flux.1 schnell](#image-generation-sdxl-lightning-and-flux1-schnell)
-11. [Configuration reference](#configuration-reference)
-12. [API endpoints](#api-endpoints)
-13. [How long audio is handled](#how-long-audio-is-handled)
-14. [Troubleshooting](#troubleshooting)
-15. [Project structure](#project-structure)
+11. [Video generation: Wan2.1 1.3B](#video-generation-wan21-13b)
+12. [Configuration reference](#configuration-reference)
+13. [API endpoints](#api-endpoints)
+14. [How long audio is handled](#how-long-audio-is-handled)
+15. [Troubleshooting](#troubleshooting)
+16. [Project structure](#project-structure)
 
 ---
 
@@ -37,6 +38,7 @@ It runs locally on any Linux/Windows/macOS machine with a CUDA-capable GPU, and 
 - **Image generation via two backends** —
   - `/image <prompt>` — fast generation (~3-4 sec) using **SDXL Lightning** 8-step UNet
   - `/imageflux <prompt>` — high-quality generation (~85 sec) using **Flux.1 schnell**, the only open model that reliably renders readable text in images
+- **Video generation** — `/video <prompt>` generates a 5-second 480P MP4 clip (~7–8 min on a 20 GB MIG slice) using **Wan2.1 1.3B**. Real CFG guidance (`guidance_scale=5.0`) means the model actually follows the prompt — a key advantage over distilled video models locked to `guidance_scale=1.0`. The clip plays inline in the browser with standard controls.
 - **GitHub-flavoured Markdown rendering** — headings, bullet/numbered lists, tables, blockquotes, code blocks, inline code, links, bold/italic. Sanitised with DOMPurify.
 - **Dark-themed responsive UI** — looks clean on desktop and mobile.
 - **Conversation history** — the browser keeps a rolling chat history (text only) and sends it back with each message for multi-turn context.
@@ -81,8 +83,9 @@ If you enable the optional image-generation services, each one wants its **own G
 |---|---|---|
 | SDXL Lightning | ~8 GB | ~13 GB (SDXL base + Lightning UNet) |
 | Flux.1 schnell | ~8 GB (with sequential offload) or ~24 GB (without) | ~24 GB |
+| Wan2.1 1.3B | ~8 GB | ~9 GB |
 
-Total disk if you run everything: ~55 GB.
+Total disk if you run everything: ~64 GB.
 
 CPU-only inference is technically possible but extremely slow (multiple minutes per token) and is not recommended.
 
@@ -571,6 +574,134 @@ for j in $(squeue -u $USER -h -n flux_gen -o %i); do scancel $j; done
 
 ---
 
+## Video generation: Wan2.1 1.3B
+
+The chat app can generate short video clips on demand by **proxying to a dedicated video-generation microservice** — `video_gen_app.py`. It runs as its own SLURM job on its own MIG slice and exposes a FastAPI service on port 8769.
+
+```
+┌────────────────────┐      /video      ┌──────────────────────────┐
+│  llm_chat_app.py   │ ───────────────▶ │  video_gen_app.py        │  ← Wan2.1 1.3B
+│  (port 8766)       │                  │  (port 8769)             │     ~7-8 min / 5s clip
+└────────────────────┘                  └──────────────────────────┘
+```
+
+**Why Wan2.1 1.3B?**
+
+Wan2.1 supports real classifier-free guidance (`guidance_scale=5.0`), meaning the model genuinely follows your prompt. Distilled models like LTX-Video 2B are locked to `guidance_scale=1.0` — they effectively ignore the prompt for multi-object or compositionally complex scenes. Wan2.1 is only 1.3 B parameters but produces dramatically better results for a wider range of subjects.
+
+| Property | Value |
+|---|---|
+| Model | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` |
+| Resolution | 832 × 480 (480P widescreen) |
+| Duration | 5 seconds (81 frames @ 16 fps) |
+| Inference steps | 50 |
+| Guidance scale | 5.0 (real CFG) |
+| VRAM footprint | ~8 GB (`enable_model_cpu_offload`) |
+| Generation time | ~7–8 min on an A100 MIG 20 GB slice |
+| Output format | Base64-encoded MP4, played inline in the browser |
+
+### Step 1 — Install imageio-ffmpeg
+
+Wan2.1 uses `diffusers.utils.export_to_video` to assemble frames into an MP4. That function needs either `av` (PyAV) or `imageio + imageio-ffmpeg`. The `av` package requires system ffmpeg libraries to compile, so the simpler path is:
+
+```bash
+conda activate rag_gemma4
+pip install imageio imageio-ffmpeg
+```
+
+No model download at this step — the weights are pulled automatically from Hugging Face on first run.
+
+### Step 2 — Submit the video-gen job
+
+```bash
+cd ~/llm_experiments
+sbatch serve_video_gen.slurm
+```
+
+Check the log:
+
+```bash
+tail -f logs/<JOBID>_video.out
+```
+
+The first run downloads **~9 GB** from Hugging Face (`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`) into `$HF_HOME`. Subsequent restarts load from cache in about 90 seconds. When you see:
+
+```
+[startup] Wan2.1 1.3B ready.
+```
+
+the service is ready to accept requests.
+
+### Step 3 — Tell the chat app where the video service lives
+
+The chat app reads one env var:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VIDEO_GEN_URL` | `http://gpu02:8769` | URL of the Wan2.1 video-generation service |
+
+If the video job lands on a different node (check `squeue`), add to `serve_llm.slurm`:
+
+```bash
+export VIDEO_GEN_URL=http://<actual_node>:8769
+```
+
+…and restart the chat job.
+
+### Step 4 — Test the video service directly (optional)
+
+From the HPC head node (cluster's internal network):
+
+```bash
+curl http://gpu02:8769/ready
+# → {"status":"ready"}
+
+curl -X POST http://gpu02:8769/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"a golden retriever running on a beach at sunset"}' \
+  --max-time 600 \
+  | python -c "
+import sys, json, base64
+d = json.load(sys.stdin)
+open('test.mp4', 'wb').write(base64.b64decode(d['video']))
+print(f'Saved test.mp4  ({d[\"num_frames\"]} frames @ {d[\"fps\"]} fps)')
+"
+```
+
+### Step 5 — Use it from the chat UI
+
+In the chat box, type:
+
+```
+/video a cat sitting on a rooftop watching city lights at night
+```
+
+You'll see a status bubble (**🎬 Generating video with Wan2.1 1.3B: …**), then the resulting video embedded inline with playback controls. The clip autoplays, loops silently, and you can unmute or go fullscreen with the standard browser controls.
+
+Generation takes 7–8 minutes for a 5-second clip. If the job runs out of VRAM at 81 frames it automatically retries at 33 frames (~2 seconds) and adds a note to the response.
+
+### Step 6 — Stopping the video-gen job
+
+```bash
+squeue -u $USER
+scancel <JOBID>
+# or by name:
+for j in $(squeue -u $USER -h -n wan_video -o %i); do scancel $j; done
+```
+
+### Quick reference
+
+| Task | Command |
+|---|---|
+| Install video deps | `pip install imageio imageio-ffmpeg` |
+| Start video service | `sbatch serve_video_gen.slurm` |
+| Check readiness | `curl http://gpu02:8769/ready` |
+| Use from chat | `/video <prompt>` |
+| Check GPU usage | `ssh gpu0X nvidia-smi` |
+| Stop the job | `scancel <JOBID>` |
+
+---
+
 ## Configuration reference
 
 All configuration is via environment variables:
@@ -583,7 +714,8 @@ All configuration is via environment variables:
 | `SYSTEM_PROMPT` | built-in default | chat | Prepended to every conversation |
 | `IMAGE_GEN_URL` | `http://gpu02:8767` | chat | Where to find the SDXL Lightning service |
 | `FLUX_GEN_URL` | `http://gpu02:8768` | chat | Where to find the Flux.1 schnell service |
-| `HF_HOME` | `/scratch/users/t07an25/llm_experiments/hf_cache` | image services | Where to cache the diffusion model weights |
+| `VIDEO_GEN_URL` | `http://gpu02:8769` | chat | Where to find the Wan2.1 video-generation service |
+| `HF_HOME` | `/scratch/users/t07an25/llm_experiments/hf_cache` | image/video services | Where to cache the diffusion model weights |
 | `HF_TOKEN` | from `~/.huggingface/token` | Flux | HF access token for the gated Flux repo |
 | `SDXL_BASE` | `stabilityai/stable-diffusion-xl-base-1.0` | SDXL service | Override SDXL base model |
 | `FLUX_MODEL` | `black-forest-labs/FLUX.1-schnell` | Flux service | Override Flux model variant |
@@ -599,6 +731,7 @@ Tunable constants live near the top of each file:
 | `MAX_INPUT_TOKENS_SOFT` | `llm_chat_app.py` | `6000` | If prompt exceeds this after history trim, drop more history |
 | `LIGHTNING_CKPT` / `N_STEPS` | `image_gen_app.py` | `..._8step_unet.safetensors` / 8 | Swap to `4step` for faster but worse generation |
 | `N_STEPS` | `flux_gen_app.py` | `4` | Flux schnell is a 1–4 step distillation |
+| `VIDEO_MODEL` | `video_gen_app.py` | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Override the Wan2.1 model variant (env var) |
 
 The `_model.generate(...)` call uses `max_new_tokens=1024`, `temperature=0.7`, `top_p=0.9`, `do_sample=True` — change these in the source if you want different sampling behaviour. Chunk summaries use `do_sample=False` (greedy) with `max_new_tokens=220` for stable, deterministic summaries.
 
@@ -631,10 +764,11 @@ The `_model.generate(...)` call uses `max_new_tokens=1024`, `temperature=0.7`, `
 | `{"transcript": "..."}` | Whisper's output, shown to the user as a separate bubble |
 | `{"text": "..."}` | A generation chunk to append to the assistant's response |
 | `{"generated_image": "data:image/png;base64,...", "prompt": "...", "model": "..."}` | A generated image to embed in the chat (from `/image` or `/imageflux`) |
+| `{"generated_video": "<base64 MP4>", "prompt": "...", "model": "...", "num_frames": N, "fps": 16}` | A generated video to embed in the chat (from `/video`) |
 | `{"error": "..."}` | Something went wrong; the UI shows it as an error bubble |
 | `{"done": true}` | End of stream |
 
-#### Image-generation services
+#### Image-generation and video-generation services
 
 Each image-gen microservice exposes the same two endpoints:
 
@@ -669,6 +803,45 @@ Or on failure:
 ```json
 { "error": "GPU OOM: ..." }
 ```
+
+#### Video-generation service
+
+`video_gen_app.py` exposes two endpoints:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/ready` | Returns `{"status": "ready"}` once the model is loaded |
+| `POST` | `/generate` | Generates one video clip |
+
+**POST `/generate` body (JSON):**
+
+```json
+{
+  "prompt": "a fox running through a snowy forest",
+  "negative_prompt": "worst quality, blurry, jittery, distorted",
+  "width": 832,
+  "height": 480,
+  "num_frames": 81,
+  "num_inference_steps": 50,
+  "guidance_scale": 5.0,
+  "seed": 42
+}
+```
+
+All fields except `prompt` are optional.
+
+**Response:**
+
+```json
+{
+  "video": "<base64-encoded MP4>",
+  "num_frames": 81,
+  "fps": 16,
+  "prompt": "a fox running through a snowy forest"
+}
+```
+
+On OOM the service automatically retries with `num_frames=33` and adds `"note": "OOM on first attempt; fell back to 33 frames."` to the response.
 
 ---
 
@@ -746,6 +919,24 @@ Classic diffusion artefact, worse on SDXL Lightning at 4 steps. Switching to 8 s
 **`Image-gen service unreachable at http://gpu02:8767`**
 The image-gen SLURM job isn't running. Check with `squeue -u $USER` — if you don't see `sdxl_gen` or `flux_gen` jobs, submit them with `sbatch serve_image_gen.slurm` / `sbatch serve_flux_gen.slurm`.
 
+**`/video` returns "Video service unreachable at http://gpu02:8769"`**
+The video-gen SLURM job isn't running. Check `squeue -u $USER` for a `wan_video` job. Submit it with `sbatch serve_video_gen.slurm`.
+
+**`/video` times out after a long wait**
+Wan2.1 at 50 inference steps takes ~7–8 min per clip. The chat app's video timeout is 900 s. If you're consistently hitting it, reduce `num_inference_steps` to 30 in `video_gen_app.py` (quality trade-off: noticeable but acceptable).
+
+**`export_to_video` fails with `No module named 'imageio'`**
+Install the imageio backend: `pip install imageio imageio-ffmpeg`.
+
+**Video output is a corrupted file / browser shows a broken video player**
+This can happen if the video job OOMed mid-frame and returned partial data. Check the video job log (`tail logs/<JOBID>_video.out`) for an OOM traceback. The OOM retry (33 frames) should prevent this, but if the retry also OOMed, you'll need a bigger MIG slice or to lower `num_frames` in `GenRequest`.
+
+**Generated video ignores the prompt / output looks like random noise**
+Make sure the job is running the Wan2.1 service (`video_gen_app.py`), not an older LTX-Video version. The `guidance_scale=5.0` default in Wan2.1 is what makes the model follow prompts — confirm this in the request by checking the job log.
+
+**`ModuleNotFoundError: No module named 'diffusers'` in video-gen log**
+The video job didn't activate the conda env. Edit `serve_video_gen.slurm` and check the `conda activate rag_gemma4` line runs before `uvicorn`.
+
 ---
 
 ## Project structure
@@ -758,6 +949,8 @@ llm_experiments/
 ├── serve_image_gen.slurm      # SLURM submission script for SDXL Lightning
 ├── flux_gen_app.py            # Flux.1 schnell FastAPI microservice (port 8768)
 ├── serve_flux_gen.slurm       # SLURM submission script for Flux.1 schnell
+├── video_gen_app.py           # Wan2.1 1.3B FastAPI microservice (port 8769)
+├── serve_video_gen.slurm      # SLURM submission script for Wan2.1 video generation
 ├── logs/                      # SLURM output/error logs, one pair per job
 ├── README.md                  # This file
 └── (external)                 # Models live outside the project tree:
