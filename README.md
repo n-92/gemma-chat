@@ -38,7 +38,9 @@ It runs locally on any Linux/Windows/macOS machine with a CUDA-capable GPU, and 
 - **Image generation via two backends** —
   - `/image <prompt>` — fast generation (~3-4 sec) using **SDXL Lightning** 8-step UNet
   - `/imageflux <prompt>` — high-quality generation (~85 sec) using **Flux.1 schnell**, the only open model that reliably renders readable text in images
-- **Video generation** — `/video <prompt>` generates a 5-second 480P MP4 clip (~7–8 min on a 20 GB MIG slice) using **Wan2.1 1.3B**. Real CFG guidance (`guidance_scale=5.0`) means the model actually follows the prompt — a key advantage over distilled video models locked to `guidance_scale=1.0`. The clip plays inline in the browser with standard controls.
+- **Video generation — two modes** —
+  - `/video <prompt>` — 5-second clip using **Wan2.1 1.3B** (~8 min on a 20 GB MIG slice). Real CFG guidance means the model follows the prompt.
+  - `/videolora <lora> <prompt>` — same quality base but with a **LoRA from `lkzd7/WAN2.2_LoraSet_NSFW`** applied on top of **Wan2.2 T2V 14B** (~30 min). Available LoRAs: `doggy`, `spoon`, `sfbehind`, `transition`. The clip plays inline with standard browser controls.
 - **GitHub-flavoured Markdown rendering** — headings, bullet/numbered lists, tables, blockquotes, code blocks, inline code, links, bold/italic. Sanitised with DOMPurify.
 - **Dark-themed responsive UI** — looks clean on desktop and mobile.
 - **Conversation history** — the browser keeps a rolling chat history (text only) and sends it back with each message for multi-turn context.
@@ -83,9 +85,10 @@ If you enable the optional image-generation services, each one wants its **own G
 |---|---|---|
 | SDXL Lightning | ~8 GB | ~13 GB (SDXL base + Lightning UNet) |
 | Flux.1 schnell | ~8 GB (with sequential offload) or ~24 GB (without) | ~24 GB |
-| Wan2.1 1.3B | ~8 GB | ~9 GB |
+| Wan2.1 1.3B (video) | ~8 GB | ~9 GB |
+| Wan2.2 T2V 14B (video LoRA) | ~12 GB (seq. offload) | ~28 GB (model) + ~9 GB (LoRA repo) |
 
-Total disk if you run everything: ~64 GB.
+Total disk if you run everything: ~100 GB.
 
 CPU-only inference is technically possible but extremely slow (multiple minutes per token) and is not recommended.
 
@@ -702,6 +705,120 @@ for j in $(squeue -u $USER -h -n wan_video -o %i); do scancel $j; done
 
 ---
 
+## LoRA video generation: Wan2.2 T2V 14B
+
+A second video service (`video_lora_app.py`) runs the larger **Wan2.2 T2V A14B** model with LoRAs from [`lkzd7/WAN2.2_LoraSet_NSFW`](https://huggingface.co/lkzd7/WAN2.2_LoraSet_NSFW). It runs on port 8770 as a separate SLURM job on its own MIG slice.
+
+```
+┌────────────────────┐   /videolora   ┌──────────────────────────────┐
+│  llm_chat_app.py   │ ─────────────▶ │  video_lora_app.py           │  ← Wan2.2 14B
+│  (port 8766)       │                │  (port 8770)                 │     + LoRA
+└────────────────────┘                └──────────────────────────────┘
+```
+
+**Why a separate service?**
+
+Wan2.2 T2V A14B is 14 B parameters (~28 GB bfloat16). It won't fit alongside Wan2.1 in the same process. With `enable_sequential_cpu_offload()` it fits in a 20 GB MIG slice but inference is slower: about **25–45 minutes per 5-second clip at 30 steps**.
+
+**Why Wan 2.2 uses LoRA pairs (HIGH + LOW noise)**
+
+Wan 2.2 has two separate denoising transformers. Each LoRA in the repo comes as two files:
+
+| File suffix | Loaded into |
+|---|---|
+| `*_high_noise.safetensors` / `*_H.safetensors` | `transformer` (first denoiser) |
+| `*_low_noise.safetensors` / `*_L.safetensors` | `transformer_2` (second denoiser, `load_into_transformer_2=True`) |
+
+The service loads both halves automatically when you specify a LoRA name.
+
+### Available LoRAs
+
+| Name | Files |
+|---|---|
+| `doggy` | `mql_doggy_a_wan22_t2v_v1_{high,low}_noise.safetensors` |
+| `spoon` | `mqlspn_a_wan22_t2v_v1_{high,low}_noise.safetensors` |
+| `sfbehind` | `sfbehind_v2.1_{high,low}_noise.safetensors` |
+| `transition` | `sid3l3g_transition_v2.0_{H,L}.safetensors` |
+
+Only T2V (text-to-video) LoRAs are listed. The I2V LoRAs in the same repo require `WanImageToVideoPipeline` and are not supported by this service.
+
+### Step 1 — Submit the LoRA service job
+
+```bash
+cd ~/llm_experiments
+sbatch serve_video_lora.slurm
+tail -f logs/<JOBID>_videolora.out
+```
+
+The first run downloads the **Wan2.2 T2V A14B model (~28 GB)** plus any requested LoRA files (~300–600 MB each) into `$HF_HOME`. Subsequent restarts load from cache in ~5 minutes. When you see:
+
+```
+[startup] Wan2.2 T2V 14B ready.
+```
+
+the service is accepting requests.
+
+### Step 2 — Tell the chat app where the LoRA service lives
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VIDEO_LORA_URL` | `http://gpu02:8770` | URL of the Wan2.2 LoRA video service |
+
+If the job lands on a different node, add to `serve_llm.slurm`:
+
+```bash
+export VIDEO_LORA_URL=http://<actual_node>:8770
+```
+
+### Step 3 — Test it directly (optional)
+
+```bash
+curl http://gpu02:8770/loras
+# → ["doggy","spoon","sfbehind","transition"]
+
+curl http://gpu02:8770/ready
+# → {"status":"ready"}
+
+curl -X POST http://gpu02:8770/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"two people in a cozy bedroom at night","lora":"doggy"}' \
+  --max-time 2700 \
+  | python -c "
+import sys, json, base64
+d = json.load(sys.stdin)
+open('lora_test.mp4', 'wb').write(base64.b64decode(d['video']))
+print(f'Saved lora_test.mp4  (lora={d[\"lora\"]}, {d[\"num_frames\"]} frames)')
+"
+```
+
+### Step 4 — Use from the chat UI
+
+```
+/videolora doggy two people in a cozy bedroom, cinematic lighting
+```
+
+The first word after `/videolora` is the LoRA name; everything else is the prompt. You'll see **🎬 Generating with Wan2.2·doggy: …** in the status bubble. The clip appears inline when done.
+
+The currently loaded LoRA is cached on the service — switching to a different LoRA takes an extra ~30 s to swap the weights.
+
+### Step 5 — Stopping the job
+
+```bash
+for j in $(squeue -u $USER -h -n wan_lora -o %i); do scancel $j; done
+```
+
+### Quick reference
+
+| Task | Command |
+|---|---|
+| Start LoRA service | `sbatch serve_video_lora.slurm` |
+| List available LoRAs | `curl http://gpu02:8770/loras` |
+| Check readiness | `curl http://gpu02:8770/ready` |
+| Use from chat | `/videolora <lora_name> <prompt>` |
+| Stop the job | `scancel <JOBID>` |
+
+---
+
 ## Configuration reference
 
 All configuration is via environment variables:
@@ -714,7 +831,10 @@ All configuration is via environment variables:
 | `SYSTEM_PROMPT` | built-in default | chat | Prepended to every conversation |
 | `IMAGE_GEN_URL` | `http://gpu02:8767` | chat | Where to find the SDXL Lightning service |
 | `FLUX_GEN_URL` | `http://gpu02:8768` | chat | Where to find the Flux.1 schnell service |
-| `VIDEO_GEN_URL` | `http://gpu02:8769` | chat | Where to find the Wan2.1 video-generation service |
+| `VIDEO_GEN_URL`  | `http://gpu02:8769` | chat | Where to find the Wan2.1 1.3B video service |
+| `VIDEO_LORA_URL` | `http://gpu02:8770` | chat | Where to find the Wan2.2 14B LoRA video service |
+| `VIDEO_LORA_MODEL` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | video LoRA service | Override the Wan2.2 base model |
+| `VIDEO_LORA_REPO`  | `lkzd7/WAN2.2_LoraSet_NSFW` | video LoRA service | HF repo containing the LoRA safetensors |
 | `HF_HOME` | `/scratch/users/t07an25/llm_experiments/hf_cache` | image/video services | Where to cache the diffusion model weights |
 | `HF_TOKEN` | from `~/.huggingface/token` | Flux | HF access token for the gated Flux repo |
 | `SDXL_BASE` | `stabilityai/stable-diffusion-xl-base-1.0` | SDXL service | Override SDXL base model |
@@ -937,6 +1057,21 @@ Make sure the job is running the Wan2.1 service (`video_gen_app.py`), not an old
 **`ModuleNotFoundError: No module named 'diffusers'` in video-gen log**
 The video job didn't activate the conda env. Edit `serve_video_gen.slurm` and check the `conda activate rag_gemma4` line runs before `uvicorn`.
 
+**`/videolora` returns "Unknown LoRA '…'"**
+The LoRA name you typed doesn't match any key in `LORAS` inside `video_lora_app.py`. Available names: `doggy`, `spoon`, `sfbehind`, `transition`. Use `curl http://gpu02:8770/loras` to get the current list from the running service.
+
+**`/videolora` service runs out of memory even with sequential offload**
+The Wan2.2 14B model requires ~48 GB of CPU RAM when using sequential offload (model weights live in system RAM). If the SLURM job is OOM-killed, check `squeue`/`sacct` and increase `--mem` in `serve_video_lora.slurm` (current default: 48 G).
+
+**LoRA switch takes a long time between `/videolora` calls**
+Each LoRA switch calls `unload_lora_weights()` + two `load_lora_weights()` calls (HIGH + LOW), which download and re-patch the model. After the first use of each LoRA the files are cached in `$HF_HOME`, so subsequent switches take ~30 s rather than minutes.
+
+**`load_into_transformer_2` keyword argument not recognised**
+Your diffusers version is too old. This parameter was added for Wan 2.2 dual-denoiser support. Upgrade: `pip install -U diffusers`.
+
+**`/videolora` times out (1800 s)**
+Wan2.2 14B with sequential offload at 30 steps takes ~25–45 min per clip. Reduce `num_inference_steps` to 20 in `video_lora_app.py` or lower `num_frames` to 33 (~2 s clip) for faster turnaround.
+
 ---
 
 ## Project structure
@@ -951,6 +1086,8 @@ llm_experiments/
 ├── serve_flux_gen.slurm       # SLURM submission script for Flux.1 schnell
 ├── video_gen_app.py           # Wan2.1 1.3B FastAPI microservice (port 8769)
 ├── serve_video_gen.slurm      # SLURM submission script for Wan2.1 video generation
+├── video_lora_app.py          # Wan2.2 T2V 14B + LoRA microservice (port 8770)
+├── serve_video_lora.slurm     # SLURM submission script for Wan2.2 LoRA video generation
 ├── logs/                      # SLURM output/error logs, one pair per job
 ├── README.md                  # This file
 └── (external)                 # Models live outside the project tree:
