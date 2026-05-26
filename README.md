@@ -17,7 +17,7 @@ It runs locally on any Linux/Windows/macOS machine with a CUDA-capable GPU, and 
 7. [Running it locally](#running-it-locally)
 8. [Running it on a SLURM HPC cluster](#running-it-on-a-slurm-hpc-cluster)
 9. [Using the chat UI](#using-the-chat-ui)
-10. [Image generation: SDXL Lightning and Flux.1 schnell](#image-generation-sdxl-lightning-and-flux1-schnell)
+10. [Image generation: Flux.1 schnell](#image-generation-flux1-schnell)
 11. [Video generation: Wan2.1 1.3B](#video-generation-wan21-13b)
 12. [Configuration reference](#configuration-reference)
 13. [API endpoints](#api-endpoints)
@@ -35,9 +35,7 @@ It runs locally on any Linux/Windows/macOS machine with a CUDA-capable GPU, and 
 - **Audio transcription** — any audio file (MP3, WAV, M4A, OGG, FLAC, AAC) is transcribed on the GPU with Whisper medium.
 - **Video files** — video files (MP4, WebM, MOV) are accepted; the audio track is extracted by ffmpeg and transcribed. There is no visual frame analysis of videos (see *What it does NOT do*).
 - **Chunked summarisation of long audio** — transcripts longer than 1 200 words are automatically split into ~900-word segments, each summarised individually, then a final answer is composed from the summaries. Lets you analyse 30+ minute podcasts on a small GPU.
-- **Image generation via two backends** —
-  - `/image <prompt>` — fast generation (~3-4 sec) using **SDXL Lightning** 8-step UNet
-  - `/imageflux <prompt>` — high-quality generation (~85 sec) using **Flux.1 schnell**, the only open model that reliably renders readable text in images
+- **Image generation** — `/imageflux <prompt>` generates a high-quality image (~85 sec) using **Flux.1 schnell**, the only open model that reliably renders readable text in images
 - **Video generation — two modes** —
   - `/video <prompt>` — 5-second clip using **Wan2.1 1.3B** (~8 min on a 20 GB MIG slice). Real CFG guidance means the model follows the prompt.
   - `/videolora <lora> <prompt>` — same quality base but with a **LoRA from `lkzd7/WAN2.2_LoraSet_NSFW`** applied on top of **Wan2.2 T2V 14B** (~30 min). Available LoRAs: `doggy`, `spoon`, `sfbehind`, `transition`. The clip plays inline with standard browser controls.
@@ -61,9 +59,8 @@ It runs locally on any Linux/Windows/macOS machine with a CUDA-capable GPU, and 
 - **No image input from URLs** — uploads only.
 - **One inference at a time** — a `threading.Lock` serialises generation. Concurrent requests will queue.
 - **No image-to-image / inpainting** — only text-to-image generation. No ControlNet, no img2img, no editing of an uploaded image.
-- **SDXL Lightning cannot render text** — words in generated images come out as gibberish. Use `/imageflux` if you need readable letters.
-- **No NSFW filtering or safety classifier** — both image services pass the raw model output through. Don't expose this to untrusted users.
-- **Gemma doesn't automatically call the image generator** — you have to type `/image` or `/imageflux` explicitly. There is no tool-calling that lets the model itself decide to draw something.
+- **No NSFW filtering or safety classifier** — the image and video services pass the raw model output through. Don't expose this to untrusted users.
+- **Gemma doesn't automatically call the image or video generator** — you have to type `/imageflux` or `/video` explicitly. There is no tool-calling that lets the model itself decide to generate media.
 
 ---
 
@@ -83,12 +80,10 @@ If you enable the optional image-generation services, each one wants its **own G
 
 | Service | Min VRAM | Disk weight cache |
 |---|---|---|
-| SDXL Lightning | ~8 GB | ~13 GB (SDXL base + Lightning UNet) |
 | Flux.1 schnell | ~8 GB (with sequential offload) or ~24 GB (without) | ~24 GB |
 | Wan2.1 1.3B (video) | ~8 GB | ~9 GB |
-| Wan2.2 T2V 14B (video LoRA) | ~12 GB (seq. offload) | ~28 GB (model) + ~9 GB (LoRA repo) |
 
-Total disk if you run everything: ~100 GB.
+Total disk if you run everything: ~55 GB.
 
 CPU-only inference is technically possible but extremely slow (multiple minutes per token) and is not recommended.
 
@@ -345,118 +340,38 @@ If you submit audio with **no typed message**, the app silently asks Gemma to "p
 
 ---
 
-## Image generation: SDXL Lightning and Flux.1 schnell
+## Image generation: Flux.1 schnell
 
-The chat app can generate images on demand by **proxying to two separate microservices** — one for fast generation (SDXL Lightning), one for high-quality generation including readable text (Flux.1 schnell). Each runs as its own SLURM job on its own MIG slice and exposes a small FastAPI on a different port.
+The chat app generates images on demand by **proxying to a dedicated microservice** — `flux_gen_app.py`. It runs as its own SLURM job on its own MIG slice and exposes a FastAPI service on port 8768.
 
 ```
-┌────────────────────┐      /image      ┌──────────────────────┐
-│  llm_chat_app.py   │ ───────────────▶ │  image_gen_app.py    │  ← SDXL Lightning
-│  (port 8766)       │                  │  (port 8767)         │     ~3-4 sec/image
-│                    │   /imageflux     ├──────────────────────┤
-│  Gemma 4 + Whisper │ ───────────────▶ │  flux_gen_app.py     │  ← Flux.1 schnell
-│                    │                  │  (port 8768)         │     ~85 sec/image
-└────────────────────┘                  └──────────────────────┘
+┌────────────────────┐   /imageflux   ┌──────────────────────┐
+│  llm_chat_app.py   │ ─────────────▶ │  flux_gen_app.py     │  ← Flux.1 schnell
+│  (port 8766)       │                │  (port 8768)         │     ~85 sec/image
+└────────────────────┘                └──────────────────────┘
 ```
 
-Why two backends?
-- **SDXL Lightning** is fast and uses little VRAM, but cannot render text and has shaky hands.
-- **Flux.1 schnell** is the only open model that reliably renders text and has good anatomy, but it's a 12 B-parameter transformer that doesn't fit naturally on a 20 GB MIG slice — we have to use sequential CPU offload, which makes it ~25× slower.
-
-Either backend can be skipped — start whichever you want. The chat app's slash commands just return an error if the corresponding service isn't running.
+Flux.1 schnell is the only open model that reliably renders readable text in images and produces correct anatomy. It's a 12 B-parameter transformer that doesn't fit on a 20 GB MIG slice natively — sequential CPU offload keeps peak VRAM under ~8 GB at the cost of ~85 sec per image.
 
 ### Step 1 — Install the diffusers library
-
-Inside the same conda env you set up for the chat app:
 
 ```bash
 conda activate rag_gemma4
 pip install -U diffusers
 ```
 
-You want **diffusers ≥ 0.32** because anything older imports a constant (`FLAX_WEIGHTS_NAME`) that was removed in `transformers` 5.x and the import will explode. Latest at time of writing: `diffusers 0.38.0`.
-
-### Step 2 — Remove the broken `bitsandbytes` if it exists
-
-`bitsandbytes` is sometimes installed transitively. If it's broken (CUDA path issues), it crashes diffusers at import time even though you don't use it. Check and remove:
+You want **diffusers ≥ 0.32** because anything older imports a constant (`FLAX_WEIGHTS_NAME`) that was removed in `transformers` 5.x. Also remove broken `bitsandbytes` if present:
 
 ```bash
 pip show bitsandbytes >/dev/null 2>&1 && pip uninstall bitsandbytes -y
 ```
 
-This is safe — neither the chat app nor either image-gen service uses it.
+### Step 2 — Get a Hugging Face access token (one-off)
 
-### Step 3 — SDXL Lightning (the fast backend)
-
-#### 3a. Files
-
-- `image_gen_app.py` — FastAPI service on port 8767
-- `serve_image_gen.slurm` — SLURM script requesting a `3g.20gb` MIG slice (any GPU with ≥ 8 GB VRAM works for SDXL Lightning)
-
-#### 3b. What gets downloaded
-
-On first run, the service fetches two things from Hugging Face and caches them in `$HF_HOME` (default `/scratch/users/<you>/llm_experiments/hf_cache`):
-
-| What | Repo | Size |
-|---|---|---|
-| SDXL base model | `stabilityai/stable-diffusion-xl-base-1.0` | ~7 GB |
-| SDXL Lightning 8-step UNet | `ByteDance/SDXL-Lightning` (`sdxl_lightning_8step_unet.safetensors`) | ~6 GB |
-
-Both are openly downloadable — **no Hugging Face token needed**.
-
-#### 3c. How it works internally
-
-1. Load the standard SDXL pipeline in `fp16` on GPU.
-2. Swap its UNet for the SDXL Lightning 8-step checkpoint.
-3. Set the scheduler to `EulerDiscreteScheduler` with `timestep_spacing="trailing"` (required by Lightning).
-4. Run inference with `num_inference_steps=8`, `guidance_scale=0.0` (Lightning is distilled without CFG).
-
-You can change `N_STEPS = 8` to `4` at the top of `image_gen_app.py` for faster but worse generation (also change the checkpoint filename to `sdxl_lightning_4step_unet.safetensors`).
-
-#### 3d. Submit the job
-
-```bash
-cd ~/llm_experiments
-sbatch serve_image_gen.slurm
-```
-
-You'll see `Submitted batch job <JOBID>`. Check the log:
-
-```bash
-tail -f logs/<JOBID>_imggen.out
-```
-
-When it prints `[startup] SDXL Lightning ready.` (≈30 seconds), it's ready to accept requests.
-
-#### 3e. Test it directly (optional)
-
-From the HPC head node (so you're on the cluster's internal network):
-
-```bash
-curl http://gpu02:8767/ready
-# → {"ready":true}
-
-curl -X POST http://gpu02:8767/generate \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"a red apple on a wooden table, photo realistic"}' \
-  | python -c "import sys,json,base64; d=json.load(sys.stdin); open('out.png','wb').write(base64.b64decode(d['image'].split(',')[1])); print('saved out.png')"
-```
-
-### Step 4 — Flux.1 schnell (the high-quality backend)
-
-#### 4a. Files
-
-- `flux_gen_app.py` — FastAPI service on port 8768
-- `serve_flux_gen.slurm` — SLURM script requesting a `3g.20gb` MIG slice
-
-#### 4b. Get a Hugging Face access token (one-off)
-
-Flux.1 schnell is **gated** even though it's Apache 2.0. You need to do two things, in order:
+Flux.1 schnell is **gated** even though it's Apache 2.0:
 
 1. Visit https://huggingface.co/black-forest-labs/FLUX.1-schnell and click **"Agree and access repository"**.
-2. Visit https://huggingface.co/settings/tokens and create a new token with **read** access. Copy the value (starts with `hf_…`).
-
-Now save the token on the cluster:
+2. Create a read token at https://huggingface.co/settings/tokens and save it on the cluster:
 
 ```bash
 mkdir -p ~/.huggingface
@@ -464,38 +379,9 @@ echo 'hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' > ~/.huggingface/token
 chmod 600 ~/.huggingface/token
 ```
 
-The Flux SLURM script automatically reads from this file and exports it as `HF_TOKEN`:
+The Flux SLURM script picks this up automatically as `HF_TOKEN`. Do this once, then forget about it.
 
-```bash
-if [ -f "$HOME/.huggingface/token" ]; then
-    export HF_TOKEN=$(cat "$HOME/.huggingface/token")
-fi
-```
-
-So you do this **once per cluster account**, then forget about it.
-
-#### 4c. What gets downloaded
-
-| What | Repo | Size |
-|---|---|---|
-| Flux.1 schnell (full) | `black-forest-labs/FLUX.1-schnell` | ~24 GB |
-
-This goes into `$HF_HOME` as well. First-time download takes a few minutes on a fast link.
-
-#### 4d. How it works internally
-
-Flux's transformer alone is ~24 GB in `bfloat16` — too big for a 20 GB MIG slice. The service:
-
-1. Loads the full Flux pipeline in `bfloat16`.
-2. Calls `pipe.enable_sequential_cpu_offload()` — streams individual transformer layers between CPU and GPU on demand. Peak VRAM stays under ~8 GB.
-3. Calls `pipe.vae.enable_tiling()` — tiles the VAE decode so the 1024×1024 final step doesn't spike memory.
-4. Runs inference with `num_inference_steps=4`, `guidance_scale=0.0`, `max_sequence_length=256`.
-
-Trade-off: ~85 sec per image instead of SDXL Lightning's 3-4 sec. Quality jump is large — Flux can write readable words, draw correct hands, and follows prompts much more literally.
-
-If you have a bigger GPU (≥ 24 GB free), you can swap `enable_sequential_cpu_offload()` for `enable_model_cpu_offload()` (faster, ~10-15 sec per image) or remove both and call `pipe.to("cuda")` (fastest, ~5 sec, but needs ≥ 28 GB).
-
-#### 4e. Submit the job
+### Step 3 — Submit the job
 
 ```bash
 cd ~/llm_experiments
@@ -503,60 +389,43 @@ sbatch serve_flux_gen.slurm
 tail -f logs/<JOBID>_flux.out
 ```
 
-Wait for `[startup] Flux.1 schnell ready.` — first run includes the 24 GB download so it can take 5-10 minutes; subsequent restarts take ~20 seconds.
+The first run downloads **~24 GB** (`black-forest-labs/FLUX.1-schnell`) into `$HF_HOME`. Subsequent restarts load from cache in ~20 seconds. When you see `[startup] Flux.1 schnell ready.` it's accepting requests.
 
-#### 4f. Test it directly (optional)
+### Step 4 — Tell the chat app where the service lives
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FLUX_GEN_URL` | `http://gpu02:8768` | URL of the Flux.1 schnell service |
+
+If the job lands on a different node, add to `serve_llm.slurm`:
 
 ```bash
+export FLUX_GEN_URL=http://<actual_node>:8768
+```
+
+### Step 5 — Use it from the chat UI
+
+```
+/imageflux a chalkboard with the words "Hello World" written in cursive
+```
+
+You'll see **🎨 Generating with Flux: …** in the status bubble, then the image inline with the prompt as caption.
+
+### Step 6 — Test it directly (optional)
+
+```bash
+curl http://gpu02:8768/ready
+# → {"ready":true}
+
 curl -X POST http://gpu02:8768/generate \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"a sign saying ABC in chunky 3D letters"}' \
   | python -c "import sys,json,base64; d=json.load(sys.stdin); open('flux.png','wb').write(base64.b64decode(d['image'].split(',')[1])); print('saved flux.png')"
 ```
 
-### Step 5 — Tell the chat app where the image services live
-
-The chat app reads two env vars (defaults shown):
-
-| Variable | Default | Used by |
-|---|---|---|
-| `IMAGE_GEN_URL` | `http://gpu02:8767` | `/image` slash command |
-| `FLUX_GEN_URL`  | `http://gpu02:8768` | `/imageflux` slash command |
-
-If your SDXL/Flux jobs land on a different node (check `squeue` — could be `gpu01`, `gpu03`, etc.), add to `serve_llm.slurm`:
+### Step 7 — Stopping the service
 
 ```bash
-export IMAGE_GEN_URL=http://<actual_node>:8767
-export FLUX_GEN_URL=http://<actual_node>:8768
-```
-
-…and restart the chat job.
-
-### Step 6 — Use it from the chat UI
-
-In the chat box, just type:
-
-```
-/image cyberpunk Tokyo skyline at sunset, neon reflections in the rain
-```
-
-or
-
-```
-/imageflux a chalkboard with the words "Hello World" written in cursive
-```
-
-You'll see a status bubble (**🎨 Generating with SDXL Lightning: …** / **🎨 Generating with Flux: …**), then the resulting image inline with the prompt as caption.
-
-If the corresponding service is down, you'll get an error message like *"Flux service unreachable at http://gpu02:8768. Is its SLURM job running?"* — go check `squeue` and submit/restart it.
-
-### Step 7 — Stopping the services
-
-```bash
-squeue -u $USER                                         # list your jobs
-scancel <SDXL_JOBID> <FLUX_JOBID>                       # cancel by id
-# or by name:
-for j in $(squeue -u $USER -h -n sdxl_gen -o %i); do scancel $j; done
 for j in $(squeue -u $USER -h -n flux_gen -o %i); do scancel $j; done
 ```
 
@@ -567,13 +436,10 @@ for j in $(squeue -u $USER -h -n flux_gen -o %i); do scancel $j; done
 | Install diffusers | `pip install -U diffusers` |
 | Remove broken bitsandbytes | `pip uninstall bitsandbytes -y` |
 | Save HF token | `echo hf_xxx > ~/.huggingface/token && chmod 600 ~/.huggingface/token` |
-| Start SDXL Lightning | `sbatch serve_image_gen.slurm` |
 | Start Flux | `sbatch serve_flux_gen.slurm` |
-| Test SDXL | `curl http://gpu02:8767/ready` |
 | Test Flux | `curl http://gpu02:8768/ready` |
-| Use SDXL from chat | `/image <prompt>` |
-| Use Flux from chat | `/imageflux <prompt>` |
-| Stop a job | `scancel <JOBID>` |
+| Use from chat | `/imageflux <prompt>` |
+| Stop the job | `scancel <JOBID>` |
 
 ---
 
@@ -829,7 +695,6 @@ All configuration is via environment variables:
 | `WHISPER_PATH` | `/scratch/users/t07an25/llm_experiments/whisper` | chat | Directory holding the Whisper `.pt` file |
 | `PORT` | `8766` / `8767` / `8768` | each service | HTTP port |
 | `SYSTEM_PROMPT` | built-in default | chat | Prepended to every conversation |
-| `IMAGE_GEN_URL` | `http://gpu02:8767` | chat | Where to find the SDXL Lightning service |
 | `FLUX_GEN_URL` | `http://gpu02:8768` | chat | Where to find the Flux.1 schnell service |
 | `VIDEO_GEN_URL`  | `http://gpu02:8769` | chat | Where to find the Wan2.1 1.3B video service |
 | `VIDEO_LORA_URL` | `http://gpu02:8770` | chat | Where to find the Wan2.2 14B LoRA video service |
@@ -849,7 +714,6 @@ Tunable constants live near the top of each file:
 | `MAX_HISTORY_TURNS` | `llm_chat_app.py` | `6` | Last N user/model turns kept in context |
 | `MAX_IMAGE_EDGE` | `llm_chat_app.py` | `896` | Downscale uploaded images so longest edge ≤ this |
 | `MAX_INPUT_TOKENS_SOFT` | `llm_chat_app.py` | `6000` | If prompt exceeds this after history trim, drop more history |
-| `LIGHTNING_CKPT` / `N_STEPS` | `image_gen_app.py` | `..._8step_unet.safetensors` / 8 | Swap to `4step` for faster but worse generation |
 | `N_STEPS` | `flux_gen_app.py` | `4` | Flux schnell is a 1–4 step distillation |
 | `VIDEO_MODEL` | `video_gen_app.py` | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` | Override the Wan2.1 model variant (env var) |
 
@@ -883,14 +747,14 @@ The `_model.generate(...)` call uses `max_new_tokens=1024`, `temperature=0.7`, `
 | `{"status": "..."}` | Live progress update for the typing bubble (transcribing, summarising, generating image, …) |
 | `{"transcript": "..."}` | Whisper's output, shown to the user as a separate bubble |
 | `{"text": "..."}` | A generation chunk to append to the assistant's response |
-| `{"generated_image": "data:image/png;base64,...", "prompt": "...", "model": "..."}` | A generated image to embed in the chat (from `/image` or `/imageflux`) |
+| `{"generated_image": "data:image/png;base64,...", "prompt": "...", "model": "..."}` | A generated image to embed in the chat (from `/imageflux`) |
 | `{"generated_video": "<base64 MP4>", "prompt": "...", "model": "...", "num_frames": N, "fps": 16}` | A generated video to embed in the chat (from `/video`) |
 | `{"error": "..."}` | Something went wrong; the UI shows it as an error bubble |
 | `{"done": true}` | End of stream |
 
 #### Image-generation and video-generation services
 
-Each image-gen microservice exposes the same two endpoints:
+Each microservice exposes the same two endpoints:
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -1030,14 +894,8 @@ Flux is gated. Visit https://huggingface.co/black-forest-labs/FLUX.1-schnell and
 **`/imageflux` works but returns `GPU OOM` at the start of every request**
 `enable_model_cpu_offload()` was chosen instead of `enable_sequential_cpu_offload()` — the full Flux transformer doesn't fit on a 20 GB slice. Open `flux_gen_app.py` and use `enable_sequential_cpu_offload()`. Slower, but actually fits.
 
-**Generated images have mangled letters or scrambled text**
-SDXL Lightning cannot render text — that's a fundamental SD limitation. Use `/imageflux` instead of `/image` when the prompt asks for words/signs/labels.
-
-**Generated images have bad hands or extra fingers**
-Classic diffusion artefact, worse on SDXL Lightning at 4 steps. Switching to 8 steps (default) helps; using Flux helps more.
-
-**`Image-gen service unreachable at http://gpu02:8767`**
-The image-gen SLURM job isn't running. Check with `squeue -u $USER` — if you don't see `sdxl_gen` or `flux_gen` jobs, submit them with `sbatch serve_image_gen.slurm` / `sbatch serve_flux_gen.slurm`.
+**`Flux service unreachable at http://gpu02:8768`**
+The flux_gen SLURM job isn't running. Submit it with `sbatch serve_flux_gen.slurm`.
 
 **`/video` returns "Video service unreachable at http://gpu02:8769"`**
 The video-gen SLURM job isn't running. Check `squeue -u $USER` for a `wan_video` job. Submit it with `sbatch serve_video_gen.slurm`.
@@ -1080,8 +938,6 @@ Wan2.2 14B with sequential offload at 30 steps takes ~25–45 min per clip. Redu
 llm_experiments/
 ├── llm_chat_app.py            # The main FastAPI chat app + inlined HTML frontend
 ├── serve_llm.slurm            # SLURM submission script for the chat app
-├── image_gen_app.py           # SDXL Lightning FastAPI microservice (port 8767)
-├── serve_image_gen.slurm      # SLURM submission script for SDXL Lightning
 ├── flux_gen_app.py            # Flux.1 schnell FastAPI microservice (port 8768)
 ├── serve_flux_gen.slurm       # SLURM submission script for Flux.1 schnell
 ├── video_gen_app.py           # Wan2.1 1.3B FastAPI microservice (port 8769)

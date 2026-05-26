@@ -21,10 +21,8 @@ WHISPER_PATH = os.environ.get("WHISPER_PATH", "/scratch/users/t07an25/llm_experi
 PORT         = int(os.environ.get("PORT", 8766))
 
 # Image-generation services (separate SLURM jobs, separate MIG slices)
-IMAGE_GEN_URL = os.environ.get("IMAGE_GEN_URL", "http://gpu02:8767")   # SDXL Lightning
 FLUX_GEN_URL  = os.environ.get("FLUX_GEN_URL",  "http://gpu02:8768")   # Flux.1 schnell
 VIDEO_GEN_URL  = os.environ.get("VIDEO_GEN_URL",  "http://gpu02:8769")  # Wan2.1 1.3B
-VIDEO_LORA_URL = os.environ.get("VIDEO_LORA_URL", "http://gpu02:8770")  # Wan2.2 14B + LoRA
 
 # System prompt prepended to every conversation. Override at runtime with
 # the SYSTEM_PROMPT env var (e.g. in serve_llm.slurm) or edit the default below.
@@ -209,10 +207,8 @@ HTML = r"""<!DOCTYPE html>
     <div class="big">✦</div>
     <h2>Gemma 4 Multimodal Chat</h2>
     <p>Send text, upload images, transcribe audio.<br>
-       <code>/image &lt;prompt&gt;</code> — fast generation (SDXL Lightning).<br>
-       <code>/imageflux &lt;prompt&gt;</code> — higher quality, can render text (Flux.1 schnell).</p>
-       <code>/video &lt;prompt&gt;</code> — 5 s clip, Wan2.1 1.3B (~8 min).<br>
-       <code>/videolora &lt;lora&gt; &lt;prompt&gt;</code> — LoRA mode, Wan2.2 14B (~30 min). LoRAs: <code>doggy spoon sfbehind transition</code>.</p>
+       <code>/imageflux &lt;prompt&gt;</code> — generate an image (Flux.1 schnell, ~85s).</p>
+       <code>/video &lt;prompt&gt;</code> — generate a 5 s video clip (Wan2.1 1.3B, ~8 min).</p>
   </div>
 </div>
 
@@ -536,49 +532,29 @@ async def chat(
         loop = asyncio.get_event_loop()
 
         # ── Slash commands ────────────────────────────────────────────────────
-        # /image <prompt>             → SDXL Lightning (fast, ~3s)
-        # /imageflux <prompt>         → Flux.1 schnell (~85s, renders text)
-        # /video <prompt>             → Wan2.1 1.3B (~8 min)
-        # /videolora <lora> <prompt>  → Wan2.2 14B + LoRA (~30 min)
+        # /imageflux <prompt>  → Flux.1 schnell (~85s, renders text)
+        # /video <prompt>      → Wan2.1 1.3B (~8 min)
         slash = None
-        slash_lora_name = None   # populated for /videolora only
         if msg_text.lower().startswith("/imageflux "):
-            slash = ("flux",      FLUX_GEN_URL,  "Flux",            msg_text[len("/imageflux "):].strip())
-        elif msg_text.lower().startswith("/image "):
-            slash = ("sdxl",      IMAGE_GEN_URL, "SDXL Lightning",  msg_text[len("/image "):].strip())
-        elif msg_text.lower().startswith("/videolora "):
-            rest  = msg_text[len("/videolora "):].strip()
-            parts = rest.split(None, 1)
-            slash_lora_name = parts[0] if parts else ""
-            lora_prompt     = parts[1] if len(parts) > 1 else ""
-            slash = ("videolora", VIDEO_LORA_URL, f"Wan2.2·{slash_lora_name}", lora_prompt)
+            slash = ("flux",  FLUX_GEN_URL,  "Flux",  msg_text[len("/imageflux "):].strip())
         elif msg_text.lower().startswith("/video "):
-            slash = ("video",     VIDEO_GEN_URL,  "Wan2.1",          msg_text[len("/video "):].strip())
+            slash = ("video", VIDEO_GEN_URL, "Wan2.1", msg_text[len("/video "):].strip())
 
         if slash is not None:
             kind, base_url, label, prompt = slash
             if not prompt:
-                if kind == "flux":      cmd_name = "imageflux"
-                elif kind == "video":   cmd_name = "video"
-                elif kind == "videolora": cmd_name = f"videolora {slash_lora_name or '<lora>'}"
-                else:                   cmd_name = "image"
+                if kind == "video": cmd_name = "video"
+                else: cmd_name = "imageflux"
                 yield f'data: {json.dumps({"error": f"Usage: /{cmd_name} <prompt>"})}\n\n'
-                return
-            if kind == "videolora" and not slash_lora_name:
-                yield f'data: {json.dumps({"error": "Usage: /videolora <lora_name> <prompt>  (LoRAs: doggy spoon sfbehind transition)"})}\n\n'
                 return
             yield f'data: {json.dumps({"status": f"Generating with {label}: {prompt[:60]}…"})}\n\n'
             try:
-                # videolora (14B seq. offload) ~1800s, video (1.3B) ~900s, Flux ~300s, SDXL ~120s
-                if kind == "videolora": timeout = 1800.0
-                elif kind == "video":   timeout = 900.0
-                elif kind == "flux":    timeout = 300.0
-                else:                   timeout = 120.0
-                payload = {"prompt": prompt}
-                if kind == "videolora" and slash_lora_name:
-                    payload["lora"] = slash_lora_name
+                # video (1.3B) ~900s, Flux ~300s
+                if kind == "video": timeout = 900.0
+                elif kind == "flux": timeout = 300.0
+                else: timeout = 120.0
                 async with httpx.AsyncClient(timeout=timeout) as client:
-                    r = await client.post(f"{base_url}/generate", json=payload)
+                    r = await client.post(f"{base_url}/generate", json={"prompt": prompt})
                 if r.status_code != 200:
                     yield f'data: {json.dumps({"error": f"{label} error: {r.text[:200]}"})}\n\n'
                     return
@@ -586,7 +562,7 @@ async def chat(
                 if "error" in data:
                     yield f'data: {json.dumps({"error": data["error"]})}\n\n'
                     return
-                if kind in ("video", "videolora"):
+                if kind == "video":
                     yield f'data: {json.dumps({"generated_video": data["video"], "num_frames": data.get("num_frames", 0), "prompt": prompt, "model": label})}\n\n'
                 else:
                     yield f'data: {json.dumps({"generated_image": data["image"], "prompt": prompt, "model": label})}\n\n'
