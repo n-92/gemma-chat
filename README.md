@@ -571,119 +571,7 @@ for j in $(squeue -u $USER -h -n wan_video -o %i); do scancel $j; done
 
 ---
 
-## LoRA video generation: Wan2.2 T2V 14B
 
-A second video service (`video_lora_app.py`) runs the larger **Wan2.2 T2V A14B** model with LoRAs from [`lkzd7/WAN2.2_LoraSet_NSFW`](https://huggingface.co/lkzd7/WAN2.2_LoraSet_NSFW). It runs on port 8770 as a separate SLURM job on its own MIG slice.
-
-```
-┌────────────────────┐   /videolora   ┌──────────────────────────────┐
-│  llm_chat_app.py   │ ─────────────▶ │  video_lora_app.py           │  ← Wan2.2 14B
-│  (port 8766)       │                │  (port 8770)                 │     + LoRA
-└────────────────────┘                └──────────────────────────────┘
-```
-
-**Why a separate service?**
-
-Wan2.2 T2V A14B is 14 B parameters (~28 GB bfloat16). It won't fit alongside Wan2.1 in the same process. With `enable_sequential_cpu_offload()` it fits in a 20 GB MIG slice but inference is slower: about **25–45 minutes per 5-second clip at 30 steps**.
-
-**Why Wan 2.2 uses LoRA pairs (HIGH + LOW noise)**
-
-Wan 2.2 has two separate denoising transformers. Each LoRA in the repo comes as two files:
-
-| File suffix | Loaded into |
-|---|---|
-| `*_high_noise.safetensors` / `*_H.safetensors` | `transformer` (first denoiser) |
-| `*_low_noise.safetensors` / `*_L.safetensors` | `transformer_2` (second denoiser, `load_into_transformer_2=True`) |
-
-The service loads both halves automatically when you specify a LoRA name.
-
-### Available LoRAs
-
-| Name | Files |
-|---|---|
-| `doggy` | `mql_doggy_a_wan22_t2v_v1_{high,low}_noise.safetensors` |
-| `spoon` | `mqlspn_a_wan22_t2v_v1_{high,low}_noise.safetensors` |
-| `sfbehind` | `sfbehind_v2.1_{high,low}_noise.safetensors` |
-| `transition` | `sid3l3g_transition_v2.0_{H,L}.safetensors` |
-
-Only T2V (text-to-video) LoRAs are listed. The I2V LoRAs in the same repo require `WanImageToVideoPipeline` and are not supported by this service.
-
-### Step 1 — Submit the LoRA service job
-
-```bash
-cd ~/llm_experiments
-sbatch serve_video_lora.slurm
-tail -f logs/<JOBID>_videolora.out
-```
-
-The first run downloads the **Wan2.2 T2V A14B model (~28 GB)** plus any requested LoRA files (~300–600 MB each) into `$HF_HOME`. Subsequent restarts load from cache in ~5 minutes. When you see:
-
-```
-[startup] Wan2.2 T2V 14B ready.
-```
-
-the service is accepting requests.
-
-### Step 2 — Tell the chat app where the LoRA service lives
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `VIDEO_LORA_URL` | `http://gpu02:8770` | URL of the Wan2.2 LoRA video service |
-
-If the job lands on a different node, add to `serve_llm.slurm`:
-
-```bash
-export VIDEO_LORA_URL=http://<actual_node>:8770
-```
-
-### Step 3 — Test it directly (optional)
-
-```bash
-curl http://gpu02:8770/loras
-# → ["doggy","spoon","sfbehind","transition"]
-
-curl http://gpu02:8770/ready
-# → {"status":"ready"}
-
-curl -X POST http://gpu02:8770/generate \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"two people in a cozy bedroom at night","lora":"doggy"}' \
-  --max-time 2700 \
-  | python -c "
-import sys, json, base64
-d = json.load(sys.stdin)
-open('lora_test.mp4', 'wb').write(base64.b64decode(d['video']))
-print(f'Saved lora_test.mp4  (lora={d[\"lora\"]}, {d[\"num_frames\"]} frames)')
-"
-```
-
-### Step 4 — Use from the chat UI
-
-```
-/videolora doggy two people in a cozy bedroom, cinematic lighting
-```
-
-The first word after `/videolora` is the LoRA name; everything else is the prompt. You'll see **🎬 Generating with Wan2.2·doggy: …** in the status bubble. The clip appears inline when done.
-
-The currently loaded LoRA is cached on the service — switching to a different LoRA takes an extra ~30 s to swap the weights.
-
-### Step 5 — Stopping the job
-
-```bash
-for j in $(squeue -u $USER -h -n wan_lora -o %i); do scancel $j; done
-```
-
-### Quick reference
-
-| Task | Command |
-|---|---|
-| Start LoRA service | `sbatch serve_video_lora.slurm` |
-| List available LoRAs | `curl http://gpu02:8770/loras` |
-| Check readiness | `curl http://gpu02:8770/ready` |
-| Use from chat | `/videolora <lora_name> <prompt>` |
-| Stop the job | `scancel <JOBID>` |
-
----
 
 ## Configuration reference
 
@@ -699,7 +587,6 @@ All configuration is via environment variables:
 | `VIDEO_GEN_URL`  | `http://gpu02:8769` | chat | Where to find the Wan2.1 1.3B video service |
 | `VIDEO_LORA_URL` | `http://gpu02:8770` | chat | Where to find the Wan2.2 14B LoRA video service |
 | `VIDEO_LORA_MODEL` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | video LoRA service | Override the Wan2.2 base model |
-| `VIDEO_LORA_REPO`  | `lkzd7/WAN2.2_LoraSet_NSFW` | video LoRA service | HF repo containing the LoRA safetensors |
 | `HF_HOME` | `/scratch/users/t07an25/llm_experiments/hf_cache` | image/video services | Where to cache the diffusion model weights |
 | `HF_TOKEN` | from `~/.huggingface/token` | Flux | HF access token for the gated Flux repo |
 | `SDXL_BASE` | `stabilityai/stable-diffusion-xl-base-1.0` | SDXL service | Override SDXL base model |
@@ -942,8 +829,6 @@ llm_experiments/
 ├── serve_flux_gen.slurm       # SLURM submission script for Flux.1 schnell
 ├── video_gen_app.py           # Wan2.1 1.3B FastAPI microservice (port 8769)
 ├── serve_video_gen.slurm      # SLURM submission script for Wan2.1 video generation
-├── video_lora_app.py          # Wan2.2 T2V 14B + LoRA microservice (port 8770)
-├── serve_video_lora.slurm     # SLURM submission script for Wan2.2 LoRA video generation
 ├── logs/                      # SLURM output/error logs, one pair per job
 ├── README.md                  # This file
 └── (external)                 # Models live outside the project tree:
