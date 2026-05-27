@@ -22,7 +22,8 @@ PORT         = int(os.environ.get("PORT", 8766))
 
 # Image-generation services (separate SLURM jobs, separate MIG slices)
 FLUX_GEN_URL  = os.environ.get("FLUX_GEN_URL",  "http://gpu02:8768")   # Flux.1 schnell
-VIDEO_GEN_URL  = os.environ.get("VIDEO_GEN_URL",  "http://gpu02:8769")  # Wan2.1 1.3B
+VIDEO_GEN_URL = os.environ.get("VIDEO_GEN_URL", "http://gpu02:8769")   # Wan2.1 1.3B
+TALK_GEN_URL  = os.environ.get("TALK_GEN_URL",  "http://gpu02:8770")   # Ditto + Chatterbox
 
 # System prompt prepended to every conversation. Override at runtime with
 # the SYSTEM_PROMPT env var (e.g. in serve_llm.slurm) or edit the default below.
@@ -207,8 +208,9 @@ HTML = r"""<!DOCTYPE html>
     <div class="big">✦</div>
     <h2>Gemma 4 Multimodal Chat</h2>
     <p>Send text, upload images, transcribe audio.<br>
-       <code>/imageflux &lt;prompt&gt;</code> — generate an image (Flux.1 schnell, ~85s).</p>
-       <code>/video &lt;prompt&gt;</code> — generate a 5 s video clip (Wan2.1 1.3B, ~8 min).</p>
+       <code>/imageflux &lt;prompt&gt;</code> — generate an image (Flux.1 schnell, ~85s).<br>
+       <code>/video &lt;prompt&gt;</code> — generate a 5 s video clip (Wan2.1 1.3B, ~8 min).<br>
+       <code>/talk &lt;text&gt;</code> — talking head video; upload a face photo first (optional).</p>
   </div>
 </div>
 
@@ -532,29 +534,40 @@ async def chat(
         loop = asyncio.get_event_loop()
 
         # ── Slash commands ────────────────────────────────────────────────────
-        # /imageflux <prompt>  → Flux.1 schnell (~85s, renders text)
-        # /video <prompt>      → Wan2.1 1.3B (~8 min)
+        # /imageflux <prompt>  → Flux.1 schnell image (~85s)
+        # /video <prompt>      → Wan2.1 1.3B video (~8 min)
+        # /talk <text>         → Ditto talking head video (~3–5 min)
+        #                        Attach a face photo to use your own face,
+        #                        or set TALK_FACE_PATH on the server as fallback.
         slash = None
         if msg_text.lower().startswith("/imageflux "):
-            slash = ("flux",  FLUX_GEN_URL,  "Flux",  msg_text[len("/imageflux "):].strip())
+            slash = ("flux",  FLUX_GEN_URL,  "Flux",   msg_text[len("/imageflux "):].strip())
         elif msg_text.lower().startswith("/video "):
             slash = ("video", VIDEO_GEN_URL, "Wan2.1", msg_text[len("/video "):].strip())
+        elif msg_text.lower().startswith("/talk "):
+            slash = ("talk",  TALK_GEN_URL,  "Ditto",  msg_text[len("/talk "):].strip())
 
         if slash is not None:
             kind, base_url, label, prompt = slash
             if not prompt:
-                if kind == "video": cmd_name = "video"
-                else: cmd_name = "imageflux"
-                yield f'data: {json.dumps({"error": f"Usage: /{cmd_name} <prompt>"})}\n\n'
+                cmd_names = {"video": "video", "talk": "talk", "flux": "imageflux"}
+                yield f'data: {json.dumps({"error": f"Usage: /{cmd_names.get(kind, kind)} <prompt>"})}\n\n'
                 return
             yield f'data: {json.dumps({"status": f"Generating with {label}: {prompt[:60]}…"})}\n\n'
             try:
-                # video (1.3B) ~900s, Flux ~300s
-                if kind == "video": timeout = 900.0
-                elif kind == "flux": timeout = 300.0
+                # Timeouts: Ditto ~600s, Wan2.1 ~900s, Flux ~300s
+                if kind == "talk":  timeout = 600.0
+                elif kind == "video": timeout = 900.0
+                elif kind == "flux":  timeout = 300.0
                 else: timeout = 120.0
+
+                # Build request — /talk can accept an uploaded face image
+                req_body: dict = {"prompt": prompt}
+                if kind == "talk" and image_bytes:
+                    req_body["face_image"] = base64.b64encode(image_bytes).decode()
+
                 async with httpx.AsyncClient(timeout=timeout) as client:
-                    r = await client.post(f"{base_url}/generate", json={"prompt": prompt})
+                    r = await client.post(f"{base_url}/generate", json=req_body)
                 if r.status_code != 200:
                     yield f'data: {json.dumps({"error": f"{label} error: {r.text[:200]}"})}\n\n'
                     return
@@ -562,7 +575,7 @@ async def chat(
                 if "error" in data:
                     yield f'data: {json.dumps({"error": data["error"]})}\n\n'
                     return
-                if kind == "video":
+                if kind in ("video", "talk"):
                     yield f'data: {json.dumps({"generated_video": data["video"], "num_frames": data.get("num_frames", 0), "prompt": prompt, "model": label})}\n\n'
                 else:
                     yield f'data: {json.dumps({"generated_image": data["image"], "prompt": prompt, "model": label})}\n\n'

@@ -19,11 +19,12 @@ It runs locally on any Linux/Windows/macOS machine with a CUDA-capable GPU, and 
 9. [Using the chat UI](#using-the-chat-ui)
 10. [Image generation: Flux.1 schnell](#image-generation-flux1-schnell)
 11. [Video generation: Wan2.1 1.3B](#video-generation-wan21-13b)
-12. [Configuration reference](#configuration-reference)
-13. [API endpoints](#api-endpoints)
-14. [How long audio is handled](#how-long-audio-is-handled)
-15. [Troubleshooting](#troubleshooting)
-16. [Project structure](#project-structure)
+12. [Talking head: Ditto + Chatterbox](#talking-head-ditto--chatterbox)
+13. [Configuration reference](#configuration-reference)
+14. [API endpoints](#api-endpoints)
+15. [How long audio is handled](#how-long-audio-is-handled)
+16. [Troubleshooting](#troubleshooting)
+17. [Project structure](#project-structure)
 
 ---
 
@@ -35,10 +36,9 @@ It runs locally on any Linux/Windows/macOS machine with a CUDA-capable GPU, and 
 - **Audio transcription** — any audio file (MP3, WAV, M4A, OGG, FLAC, AAC) is transcribed on the GPU with Whisper medium.
 - **Video files** — video files (MP4, WebM, MOV) are accepted; the audio track is extracted by ffmpeg and transcribed. There is no visual frame analysis of videos (see *What it does NOT do*).
 - **Chunked summarisation of long audio** — transcripts longer than 1 200 words are automatically split into ~900-word segments, each summarised individually, then a final answer is composed from the summaries. Lets you analyse 30+ minute podcasts on a small GPU.
-- **Image generation** — `/imageflux <prompt>` generates a high-quality image (~85 sec) using **Flux.1 schnell**, the only open model that reliably renders readable text in images
-- **Video generation — two modes** —
-  - `/video <prompt>` — 5-second clip using **Wan2.1 1.3B** (~8 min on a 20 GB MIG slice). Real CFG guidance means the model follows the prompt.
-  - `/videolora <lora> <prompt>` — same quality base but with a **LoRA from `lkzd7/WAN2.2_LoraSet_NSFW`** applied on top of **Wan2.2 T2V 14B** (~30 min). Available LoRAs: `doggy`, `spoon`, `sfbehind`, `transition`. The clip plays inline with standard browser controls.
+- **Image generation** — `/imageflux <prompt>` generates a high-quality image (~85 sec) using **Flux.1 schnell**, the only open model that reliably renders readable text in images.
+- **Video generation** — `/video <prompt>` — 5-second clip using **Wan2.1 1.3B** (~8 min on a 20 GB MIG slice). Real CFG guidance means the model follows the prompt.
+- **Talking head video** — `/talk <text>` — upload a face photo then type what you want it to say. **Chatterbox TTS** synthesises the speech, **Ditto** animates the face in sync. (~3–5 min on a 20 GB MIG slice).
 - **GitHub-flavoured Markdown rendering** — headings, bullet/numbered lists, tables, blockquotes, code blocks, inline code, links, bold/italic. Sanitised with DOMPurify.
 - **Dark-themed responsive UI** — looks clean on desktop and mobile.
 - **Conversation history** — the browser keeps a rolling chat history (text only) and sends it back with each message for multi-turn context.
@@ -78,12 +78,13 @@ Gemma 4 27B loaded in `bfloat16` occupies about **15 GB** of VRAM. Whisper mediu
 
 If you enable the optional image-generation services, each one wants its **own GPU** (or its own MIG slice). They cannot share VRAM with the chat job:
 
-| Service | Min VRAM | Disk weight cache |
+| Service | Min VRAM | Disk (weight cache) |
 |---|---|---|
-| Flux.1 schnell | ~8 GB (with sequential offload) or ~24 GB (without) | ~24 GB |
+| Flux.1 schnell | ~8 GB (with sequential offload) | ~24 GB |
 | Wan2.1 1.3B (video) | ~8 GB | ~9 GB |
+| Ditto + Chatterbox (talking head) | ~8–12 GB | ~5 GB |
 
-Total disk if you run everything: ~55 GB.
+Total disk if you run everything: ~60 GB.
 
 CPU-only inference is technically possible but extremely slow (multiple minutes per token) and is not recommended.
 
@@ -571,7 +572,160 @@ for j in $(squeue -u $USER -h -n wan_video -o %i); do scancel $j; done
 
 ---
 
+## Talking head: Ditto + Chatterbox
 
+The chat app can animate any face photo to say any text using a two-stage pipeline:
+
+```
+┌────────────────────┐     /talk      ┌──────────────────────────────┐
+│  llm_chat_app.py   │ ─────────────▶ │  ditto_talk_app.py           │
+│  (port 8766)       │                │  (port 8770)                 │
+└────────────────────┘                └──────────────────────────────┘
+                                            │
+                                   ┌────────┴────────┐
+                             Chatterbox TTS      Ditto
+                             (text → WAV)    (WAV + image → MP4)
+```
+
+1. **Chatterbox TTS** (Resemble AI) synthesises natural-sounding speech from the text prompt. Optionally clones a reference voice from a short WAV clip.
+2. **Ditto** (Antgroup) animates the face photo in sync with the audio — lip movement, head pose, blinking.
+
+| Property | Value |
+|---|---|
+| TTS model | `resemble-ai/chatterbox` |
+| Video model | `antgroup/ditto-talkinghead` (PyTorch backend) |
+| Face input | Single PNG/JPG — upload in chat or set `TALK_FACE_PATH` on server |
+| Voice cloning | Optional: set `TALK_VOICE_PATH` to a ~10 s reference WAV |
+| Output | MP4 (duration matches the spoken text), played inline |
+| Generation time | ~3–5 min on a 20 GB MIG slice |
+| Port | 8770 |
+
+### Step 1 — Clone Ditto and create the conda env
+
+Ditto requires Python 3.10 + TensorRT 8.6.1 (or its ONNX fallback). It uses a separate env from the main chat service.
+
+```bash
+# On the HPC head node:
+git clone https://github.com/antgroup/ditto-talkinghead \
+    ~/llm_experiments/ditto-talkinghead
+cd ~/llm_experiments/ditto-talkinghead
+conda env create -f environment.yaml    # creates env "ditto" with Python 3.10
+conda activate ditto
+pip install chatterbox-tts              # add TTS on top of the Ditto env
+```
+
+### Step 2 — Download Ditto checkpoints
+
+```bash
+cd ~/llm_experiments/ditto-talkinghead
+git lfs install
+git clone https://huggingface.co/digital-avatar/ditto-talkinghead checkpoints
+```
+
+This pulls ~5 GB into `checkpoints/`. Chatterbox downloads automatically from HF on first run (~2 GB).
+
+### Step 3 — Copy your face photo to the HPC
+
+```bash
+# From your local machine:
+scp -i ~/.ssh/macleod1_key face.png \
+    t07an25@macleod1.abdn.ac.uk:~/llm_experiments/face.png
+```
+
+Any clear front-facing photo works. The service falls back to `TALK_FACE_PATH` if no image is uploaded in the chat.
+
+### Step 4 — Copy the service files and submit the job
+
+```bash
+# From your local machine:
+scp -i ~/.ssh/macleod1_key ditto_talk_app.py \
+    t07an25@macleod1.abdn.ac.uk:~/llm_experiments/
+
+scp -i ~/.ssh/macleod1_key serve_ditto_talk.slurm \
+    t07an25@macleod1.abdn.ac.uk:~/llm_experiments/
+```
+
+Then on the HPC:
+
+```bash
+cd ~/llm_experiments
+sbatch serve_ditto_talk.slurm
+tail -f logs/<JOBID>_ditto_talk.out
+```
+
+When you see:
+
+```
+[startup] Chatterbox ready (sr=24000 Hz).
+[startup] Ditto ready.
+```
+
+the service is accepting requests.
+
+### Step 5 — Tell the chat app where the service lives
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TALK_GEN_URL` | `http://gpu02:8770` | URL of the Ditto talking head service |
+
+If the job lands on a different node, add to `serve_llm.slurm`:
+
+```bash
+export TALK_GEN_URL=http://<actual_node>:8770
+```
+
+### Step 6 — Use it from the chat UI
+
+**With a face photo uploaded:**
+1. Click the 📎 button and pick a face photo.
+2. Type `/talk Hello world, this is a talking head video.` and send.
+
+**With the server-side default face:**
+```
+/talk Hello world, this is a talking head video.
+```
+
+You'll see **🎬 Generating with Ditto: …** in the status bubble, then the video inline.
+
+### Step 7 — Test the service directly (optional)
+
+```bash
+curl http://gpu02:8770/ready
+# → {"status":"ready"}
+
+# Generate with the server-side face:
+curl -X POST http://gpu02:8770/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Hello, I am a talking head powered by Ditto and Chatterbox."}' \
+  --max-time 400 \
+  | python -c "
+import sys, json, base64
+d = json.load(sys.stdin)
+open('talk_test.mp4', 'wb').write(base64.b64decode(d['video']))
+print('Saved talk_test.mp4')
+"
+```
+
+### Step 8 — Stopping the job
+
+```bash
+for j in $(squeue -u $USER -h -n ditto_talk -o %i); do scancel $j; done
+```
+
+### Quick reference
+
+| Task | Command |
+|---|---|
+| Clone Ditto repo | `git clone https://github.com/antgroup/ditto-talkinghead ~/llm_experiments/ditto-talkinghead` |
+| Create env | `conda env create -f environment.yaml && conda activate ditto && pip install chatterbox-tts` |
+| Download checkpoints | `git clone https://huggingface.co/digital-avatar/ditto-talkinghead checkpoints` |
+| Copy face photo | `scp face.png t07an25@macleod1.abdn.ac.uk:~/llm_experiments/face.png` |
+| Start service | `sbatch serve_ditto_talk.slurm` |
+| Check readiness | `curl http://gpu02:8770/ready` |
+| Use from chat | Upload face photo → `/talk <text>` |
+| Stop the job | `scancel <JOBID>` |
+
+---
 
 ## Configuration reference
 
@@ -584,12 +738,15 @@ All configuration is via environment variables:
 | `PORT` | `8766` / `8767` / `8768` | each service | HTTP port |
 | `SYSTEM_PROMPT` | built-in default | chat | Prepended to every conversation |
 | `FLUX_GEN_URL` | `http://gpu02:8768` | chat | Where to find the Flux.1 schnell service |
-| `VIDEO_GEN_URL`  | `http://gpu02:8769` | chat | Where to find the Wan2.1 1.3B video service |
-| `VIDEO_LORA_URL` | `http://gpu02:8770` | chat | Where to find the Wan2.2 14B LoRA video service |
-| `VIDEO_LORA_MODEL` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | video LoRA service | Override the Wan2.2 base model |
-| `HF_HOME` | `/scratch/users/t07an25/llm_experiments/hf_cache` | image/video services | Where to cache the diffusion model weights |
+| `VIDEO_GEN_URL` | `http://gpu02:8769` | chat | Where to find the Wan2.1 1.3B video service |
+| `TALK_GEN_URL` | `http://gpu02:8770` | chat | Where to find the Ditto talking head service |
+| `TALK_FACE_PATH` | _(must be set)_ | ditto service | Path to fallback face image on the HPC |
+| `TALK_VOICE_PATH` | _(optional)_ | ditto service | Path to ~10 s reference WAV for voice cloning |
+| `DITTO_REPO` | `~/llm_experiments/ditto-talkinghead` | ditto service | Path to cloned Ditto repo |
+| `DITTO_DATA_ROOT` | `$DITTO_REPO/checkpoints/ditto_pytorch` | ditto service | Ditto PyTorch checkpoint dir |
+| `DITTO_CFG` | `$DITTO_REPO/checkpoints/ditto_cfg/v0.4_hubert_cfg_pytorch.pkl` | ditto service | Ditto config pickle |
+| `HF_HOME` | `/scratch/users/t07an25/llm_experiments/hf_cache` | image/video/talk services | Where to cache diffusion model weights |
 | `HF_TOKEN` | from `~/.huggingface/token` | Flux | HF access token for the gated Flux repo |
-| `SDXL_BASE` | `stabilityai/stable-diffusion-xl-base-1.0` | SDXL service | Override SDXL base model |
 | `FLUX_MODEL` | `black-forest-labs/FLUX.1-schnell` | Flux service | Override Flux model variant |
 
 Tunable constants live near the top of each file:
@@ -790,6 +947,21 @@ The video-gen SLURM job isn't running. Check `squeue -u $USER` for a `wan_video`
 **`/video` times out after a long wait**
 Wan2.1 at 50 inference steps takes ~7–8 min per clip. The chat app's video timeout is 900 s. If you're consistently hitting it, reduce `num_inference_steps` to 30 in `video_gen_app.py` (quality trade-off: noticeable but acceptable).
 
+**`/talk` returns "No face image provided and TALK_FACE_PATH not set"**
+Either upload a face photo in the chat before sending `/talk`, or SCP a face image to the HPC and set `TALK_FACE_PATH` in `serve_ditto_talk.slurm`.
+
+**`/talk` returns "stream_pipeline_offline not found" or similar ImportError**
+The Ditto repo path is wrong. Check that `DITTO_REPO` in `serve_ditto_talk.slurm` points at the cloned `ditto-talkinghead` directory and that `sys.path.insert(0, DITTO_REPO)` at the top of `ditto_talk_app.py` is present.
+
+**`/talk` service is stuck loading / never reaches "Ditto ready"**
+Check the job log: `tail logs/<JOBID>_ditto_talk.out`. Most likely cause is the checkpoints directory not existing — run the `git clone https://huggingface.co/digital-avatar/ditto-talkinghead checkpoints` step inside the Ditto repo.
+
+**`/talk` produces audio but the mouth doesn't move**
+Ditto requires audio at exactly 16 kHz. The service resamples Chatterbox output automatically, but if you see a Ditto-side error in the log about sample rate, check that `torchaudio` is installed in the `ditto` conda env.
+
+**`/talk` times out (600 s)**
+Reduce the text length — longer speech = more video frames = longer Ditto inference. Alternatively raise `timeout` for `kind == "talk"` in `llm_chat_app.py`.
+
 **`export_to_video` fails with `No module named 'imageio'`**
 Install the imageio backend: `pip install imageio imageio-ffmpeg`.
 
@@ -802,20 +974,6 @@ Make sure the job is running the Wan2.1 service (`video_gen_app.py`), not an old
 **`ModuleNotFoundError: No module named 'diffusers'` in video-gen log**
 The video job didn't activate the conda env. Edit `serve_video_gen.slurm` and check the `conda activate rag_gemma4` line runs before `uvicorn`.
 
-**`/videolora` returns "Unknown LoRA '…'"**
-The LoRA name you typed doesn't match any key in `LORAS` inside `video_lora_app.py`. Available names: `doggy`, `spoon`, `sfbehind`, `transition`. Use `curl http://gpu02:8770/loras` to get the current list from the running service.
-
-**`/videolora` service runs out of memory even with sequential offload**
-The Wan2.2 14B model requires ~48 GB of CPU RAM when using sequential offload (model weights live in system RAM). If the SLURM job is OOM-killed, check `squeue`/`sacct` and increase `--mem` in `serve_video_lora.slurm` (current default: 48 G).
-
-**LoRA switch takes a long time between `/videolora` calls**
-Each LoRA switch calls `unload_lora_weights()` + two `load_lora_weights()` calls (HIGH + LOW), which download and re-patch the model. After the first use of each LoRA the files are cached in `$HF_HOME`, so subsequent switches take ~30 s rather than minutes.
-
-**`load_into_transformer_2` keyword argument not recognised**
-Your diffusers version is too old. This parameter was added for Wan 2.2 dual-denoiser support. Upgrade: `pip install -U diffusers`.
-
-**`/videolora` times out (1800 s)**
-Wan2.2 14B with sequential offload at 30 steps takes ~25–45 min per clip. Reduce `num_inference_steps` to 20 in `video_lora_app.py` or lower `num_frames` to 33 (~2 s clip) for faster turnaround.
 
 ---
 
@@ -823,18 +981,23 @@ Wan2.2 14B with sequential offload at 30 steps takes ~25–45 min per clip. Redu
 
 ```
 llm_experiments/
-├── llm_chat_app.py            # The main FastAPI chat app + inlined HTML frontend
-├── serve_llm.slurm            # SLURM submission script for the chat app
-├── flux_gen_app.py            # Flux.1 schnell FastAPI microservice (port 8768)
-├── serve_flux_gen.slurm       # SLURM submission script for Flux.1 schnell
-├── video_gen_app.py           # Wan2.1 1.3B FastAPI microservice (port 8769)
-├── serve_video_gen.slurm      # SLURM submission script for Wan2.1 video generation
+├── llm_chat_app.py            # Main FastAPI chat app + inlined HTML frontend
+├── serve_llm.slurm            # SLURM script for the chat app (port 8766)
+├── flux_gen_app.py            # Flux.1 schnell image microservice (port 8768)
+├── serve_flux_gen.slurm       # SLURM script for Flux.1 schnell
+├── video_gen_app.py           # Wan2.1 1.3B video microservice (port 8769)
+├── serve_video_gen.slurm      # SLURM script for Wan2.1 video generation
+├── ditto_talk_app.py          # Ditto + Chatterbox talking head microservice (port 8770)
+├── serve_ditto_talk.slurm     # SLURM script for Ditto talking head
+├── face.png                   # Default face image for /talk (SCP from local machine)
 ├── logs/                      # SLURM output/error logs, one pair per job
+├── ditto-talkinghead/         # Cloned antgroup/ditto-talkinghead repo
+│   └── checkpoints/           #   ~5 GB Ditto model weights
 ├── README.md                  # This file
 └── (external)                 # Models live outside the project tree:
     /path/to/gemma4/           #   15 GB Gemma 4 model files
     /path/to/whisper/          #   1.5 GB Whisper medium .pt
-    $HF_HOME/hub/...           #   SDXL base (~7 GB) + Lightning UNet (~6 GB) + Flux (~24 GB)
+    $HF_HOME/hub/...           #   Flux (~24 GB) + Wan2.1 (~9 GB) + Chatterbox (~2 GB)
 ```
 
 The three services are completely independent — start, stop, and restart them on their own schedules. They communicate via plain HTTP on the cluster's internal network, not via shared memory or pipes.
