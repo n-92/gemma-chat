@@ -698,7 +698,8 @@ async def chat(
                 story_style = (m.group(1) or m.group(2) or m.group(3)).strip()
                 arg = (arg[:m.start()] + arg[m.end():]).strip()
             if not arg:
-                yield f'data: {json.dumps({"error": "Usage: /story [--style \\"art style\\"] <article URL or pasted text>"})}\n\n'
+                _usage = json.dumps({"error": 'Usage: /story [--style "art style"] <article URL or pasted text>'})
+                yield f"data: {_usage}\n\n"
                 return
             # A leading http(s):// is treated as a URL to fetch; anything else is
             # treated as the article text pasted directly into the chat.
