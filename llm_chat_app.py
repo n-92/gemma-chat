@@ -210,7 +210,7 @@ HTML = r"""<!DOCTYPE html>
     <p>Send text, upload images, transcribe audio.<br>
        <code>/imageflux &lt;prompt&gt;</code> — generate an image (Flux.1 schnell, ~85s).<br>
        <code>/video &lt;prompt&gt;</code> — generate a 5 s video clip (Wan2.1 1.3B, ~8 min).<br>
-       <code>/talk &lt;text&gt;</code> — talking head video; upload a face photo first (optional).</p>
+       <code>/talk &lt;text&gt;</code> — talking head video. Optionally attach a face photo and/or an audio clip (5-20 s) to clone that voice.</p>
   </div>
 </div>
 
@@ -220,7 +220,7 @@ HTML = r"""<!DOCTYPE html>
     <button class="btn btn-upload" onclick="document.getElementById('file-input').click()" title="Upload image, audio or video">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
     </button>
-    <input type="file" id="file-input" accept="image/*,audio/*,video/*,.mp3,.wav,.m4a,.mp4,.webm,.ogg" style="display:none" onchange="handleFile(this)">
+    <input type="file" id="file-input" multiple accept="image/*,audio/*,video/*,.mp3,.wav,.m4a,.mp4,.webm,.ogg" style="display:none" onchange="handleFile(this)">
     <textarea id="msg-input" placeholder="Message Gemma 4…" rows="1"
       onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send();}"
       oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,140)+'px'"></textarea>
@@ -232,7 +232,8 @@ HTML = r"""<!DOCTYPE html>
 
 <script>
 let history = [];
-let pendingImage = null;   // { file, dataUrl }
+let pendingImage = null;   // { file, dataUrl }      — picture for vision / face
+let pendingAudio = null;   // { file, dataUrl, name } — audio for Whisper / voice-clone
 let ready = false;
 
 // Poll until model ready
@@ -252,37 +253,46 @@ async function pollReady() {
 pollReady();
 
 function handleFile(input) {
-  const file = input.files[0];
-  if (!file) return;
-  const isAudio = file.type.startsWith('audio/') || file.type.startsWith('video/') ||
-    /\.(mp3|wav|m4a|mp4|webm|ogg|flac|aac)$/i.test(file.name);
-  const reader = new FileReader();
-  reader.onload = e => {
-    pendingImage = { file, dataUrl: e.target.result, isAudio };
-    const area = document.getElementById('preview-area');
-    area.innerHTML = '';
-    const wrap = document.createElement('div');
-    wrap.className = 'preview-item';
-    if (isAudio) {
-      wrap.innerHTML = `
-        <div style="display:flex;align-items:center;gap:8px;background:var(--surface2);padding:6px 10px;border-radius:8px;border:1px solid var(--border)">
-          <span style="font-size:1.2rem">🎵</span>
-          <span class="fname">${esc(file.name)}</span>
-          <button class="remove" onclick="clearImage()" style="position:static;margin-left:4px">✕</button>
-        </div>`;
-    } else {
-      wrap.innerHTML = `<img src="${e.target.result}"><button class="remove" onclick="clearImage()">✕</button>`;
-    }
-    area.appendChild(wrap);
-  };
-  reader.readAsDataURL(file);
+  // Accept one or more files at once; dispatch each into the image or audio slot.
+  const files = Array.from(input.files || []);
+  files.forEach(file => {
+    const isAudio = file.type.startsWith('audio/') || file.type.startsWith('video/') ||
+      /\.(mp3|wav|m4a|mp4|webm|ogg|flac|aac)$/i.test(file.name);
+    const reader = new FileReader();
+    reader.onload = e => {
+      if (isAudio) pendingAudio = { file, dataUrl: e.target.result, name: file.name };
+      else         pendingImage = { file, dataUrl: e.target.result };
+      renderPreviews();
+    };
+    reader.readAsDataURL(file);
+  });
   input.value = '';
 }
 
-function clearImage() {
-  pendingImage = null;
-  document.getElementById('preview-area').innerHTML = '';
+function renderPreviews() {
+  const area = document.getElementById('preview-area');
+  area.innerHTML = '';
+  if (pendingImage) {
+    const w = document.createElement('div');
+    w.className = 'preview-item';
+    w.innerHTML = `<img src="${pendingImage.dataUrl}"><button class="remove" onclick="clearImage()">✕</button>`;
+    area.appendChild(w);
+  }
+  if (pendingAudio) {
+    const w = document.createElement('div');
+    w.className = 'preview-item';
+    w.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;background:var(--surface2);padding:6px 10px;border-radius:8px;border:1px solid var(--border)">
+        <span style="font-size:1.2rem">🎵</span>
+        <span class="fname">${esc(pendingAudio.name)}</span>
+        <button class="remove" onclick="clearAudio()" style="position:static;margin-left:4px">✕</button>
+      </div>`;
+    area.appendChild(w);
+  }
 }
+
+function clearImage() { pendingImage = null; renderPreviews(); }
+function clearAudio() { pendingAudio = null; renderPreviews(); }
 
 function esc(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -307,7 +317,7 @@ function renderMarkdown(text) {
   }
 }
 
-function appendMsg(role, text, mediaUrl, isAudio) {
+function appendMsg(role, text, imgUrl, audUrl, audName) {
   const welcome = document.getElementById('welcome');
   if (welcome) welcome.remove();
 
@@ -315,11 +325,20 @@ function appendMsg(role, text, mediaUrl, isAudio) {
   const div = document.createElement('div');
   div.className = `msg ${role}`;
   const avatar = role === 'user' ? '👤' : '✦';
+  // Back-compat: callers that pass a single mediaUrl + boolean still work.
+  if (typeof audUrl === 'boolean') {
+    const wasAudio = audUrl;
+    audUrl = wasAudio ? imgUrl : null;
+    imgUrl = wasAudio ? null   : imgUrl;
+    audName = null;
+  }
   let mediaHtml = '';
-  if (mediaUrl && isAudio) {
-    mediaHtml = `<audio controls src="${mediaUrl}" style="max-width:260px;display:block;margin-bottom:6px"></audio>`;
-  } else if (mediaUrl) {
-    mediaHtml = `<img src="${mediaUrl}" alt="uploaded image">`;
+  if (imgUrl) {
+    mediaHtml += `<img src="${imgUrl}" alt="uploaded image">`;
+  }
+  if (audUrl) {
+    mediaHtml += `<audio controls src="${audUrl}" style="max-width:260px;display:block;margin:6px 0"></audio>`;
+    if (audName) mediaHtml += `<div style="font-size:.7rem;color:var(--text-dim);margin-bottom:6px">🎵 ${esc(audName)}</div>`;
   }
   div.innerHTML = `
     <div class="avatar">${avatar}</div>
@@ -402,17 +421,19 @@ async function send() {
   if (!ready) return;
   const input = document.getElementById('msg-input');
   const text = input.value.trim();
-  if (!text && !pendingImage) return;
+  if (!text && !pendingImage && !pendingAudio) return;
 
   const btn = document.getElementById('send-btn');
   btn.disabled = true;
   input.value = '';
   input.style.height = 'auto';
 
-  const mediaUrl   = pendingImage ? pendingImage.dataUrl : null;
-  const isAudio    = pendingImage ? pendingImage.isAudio : false;
-  const pendingFile = pendingImage ? pendingImage.file : null;
-  appendMsg('user', text, mediaUrl, isAudio);
+  const imgUrl   = pendingImage ? pendingImage.dataUrl : null;
+  const audUrl   = pendingAudio ? pendingAudio.dataUrl : null;
+  const audName  = pendingAudio ? pendingAudio.name    : null;
+  const imgFile  = pendingImage ? pendingImage.file    : null;
+  const audFile  = pendingAudio ? pendingAudio.file    : null;
+  appendMsg('user', text, imgUrl, audUrl, audName);
 
   let typingEl = appendTyping();
   let aiTextEl = null;
@@ -421,11 +442,10 @@ async function send() {
   const fd = new FormData();
   fd.append('message', text);
   fd.append('history', JSON.stringify(history));
-  if (pendingFile) {
-    if (isAudio) fd.append('audio', pendingFile);
-    else         fd.append('image', pendingFile);
-  }
+  if (imgFile) fd.append('image', imgFile);
+  if (audFile) fd.append('audio', audFile);
   clearImage();
+  clearAudio();
 
   try {
     const resp = await fetch('/chat', { method: 'POST', body: fd });
@@ -562,9 +582,13 @@ async def chat(
                 else: timeout = 120.0
 
                 # Build request — /talk can accept an uploaded face image
+                # and/or an uploaded audio clip used as the voice reference for
+                # Chatterbox cloning (overrides server-side TALK_VOICE_PATH).
                 req_body: dict = {"prompt": prompt}
                 if kind == "talk" and image_bytes:
                     req_body["face_image"] = base64.b64encode(image_bytes).decode()
+                if kind == "talk" and audio_bytes:
+                    req_body["voice_ref"] = base64.b64encode(audio_bytes).decode()
 
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     r = await client.post(f"{base_url}/generate", json=req_body)

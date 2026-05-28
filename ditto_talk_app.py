@@ -113,6 +113,7 @@ async def on_startup():
 class TalkRequest(BaseModel):
     prompt:       str
     face_image:   str | None = None   # base64 PNG/JPG; falls back to TALK_FACE_PATH
+    voice_ref:    str | None = None   # base64 WAV/MP3 (5-20s clean speech); falls back to TALK_VOICE_PATH
     exaggeration: float = 0.5         # 0 = neutral, 1 = highly expressive
     cfg_weight:   float = 0.5         # Chatterbox CFG weight
 
@@ -156,7 +157,14 @@ async def generate(req: TalkRequest):
                         return {"error": f"Face image not found: {face_path}"}
 
                     # ── 2. Chatterbox TTS: text → WAV ──────────────────────────
-                    voice_ref = TALK_VOICE_PATH or None
+                    # Per-request voice_ref overrides the server-side default.
+                    if req.voice_ref:
+                        vref_path = tmp / "voice_ref.audio"
+                        vref_path.write_bytes(base64.b64decode(req.voice_ref))
+                        voice_ref = str(vref_path)
+                    else:
+                        voice_ref = TALK_VOICE_PATH or None
+                    print(f"[generate] voice_ref={voice_ref or '<chatterbox default>'}", flush=True)
                     wav_tensor = _tts.generate(
                         req.prompt,
                         audio_prompt_path=voice_ref,

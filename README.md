@@ -38,7 +38,8 @@ It runs locally on any Linux/Windows/macOS machine with a CUDA-capable GPU, and 
 - **Chunked summarisation of long audio** — transcripts longer than 1 200 words are automatically split into ~900-word segments, each summarised individually, then a final answer is composed from the summaries. Lets you analyse 30+ minute podcasts on a small GPU.
 - **Image generation** — `/imageflux <prompt>` generates a high-quality image (~85 sec) using **Flux.1 schnell**, the only open model that reliably renders readable text in images.
 - **Video generation** — `/video <prompt>` — 5-second clip using **Wan2.1 1.3B** (~8 min on a 20 GB MIG slice). Real CFG guidance means the model follows the prompt.
-- **Talking head video** — `/talk <text>` — upload a face photo then type what you want it to say. **Chatterbox TTS** synthesises the speech, **Ditto** animates the face in sync. (~3–5 min on a 20 GB MIG slice).
+- **Talking head video** — `/talk <text>` — upload a face photo (optional) and any voice clip (optional) then type what you want it to say. **Chatterbox TTS** synthesises the speech (with voice cloning if a clip is attached), **Ditto** animates the face in sync. (~3–5 min on a 20 GB MIG slice).
+- **Dual attachments per message** — attach a picture *and* an audio clip at the same time. With `/talk`, the picture is the face and the audio is the voice reference for cloning.
 - **GitHub-flavoured Markdown rendering** — headings, bullet/numbered lists, tables, blockquotes, code blocks, inline code, links, bold/italic. Sanitised with DOMPurify.
 - **Dark-themed responsive UI** — looks clean on desktop and mobile.
 - **Conversation history** — the browser keeps a rolling chat history (text only) and sends it back with each message for multi-turn context.
@@ -574,35 +575,43 @@ for j in $(squeue -u $USER -h -n wan_video -o %i); do scancel $j; done
 
 ## Talking head: Ditto + Chatterbox
 
-The chat app can animate any face photo to say any text using a two-stage pipeline:
+The chat app can animate any face photo to say any text in any voice using a two-stage pipeline:
 
 ```
-┌────────────────────┐     /talk      ┌──────────────────────────────┐
-│  llm_chat_app.py   │ ─────────────▶ │  ditto_talk_app.py           │
-│  (port 8766)       │                │  (port 8770)                 │
-└────────────────────┘                └──────────────────────────────┘
-                                            │
-                                   ┌────────┴────────┐
-                             Chatterbox TTS      Ditto
-                             (text → WAV)    (WAV + image → MP4)
+                            ┌───────────────────────┐
+                            │   ditto_talk_app.py   │
+                            │   FastAPI · port 8770 │
+       /talk <text>         │                       │
+  ┌────┐  + image (face)    │   1) Chatterbox TTS   │   ┌───────────┐
+  │chat│ ─ + audio (voice) ─┼──▶  text + voice_ref  │──▶│  WAV 16k  │
+  └────┘                    │     → speech WAV      │   └─────┬─────┘
+   port 8766                │                       │         │
+   (llm_chat_app.py)        │   2) Ditto SDK        │   ┌─────▼─────┐
+        ▲                   │      WAV + face       │──▶│   MP4     │
+        │  generated_video  │      → talking head   │   └─────┬─────┘
+        └───────────────────┤                       │         │
+                            │   3) base64 + JSON ◀──┼─────────┘
+                            └───────────────────────┘
 ```
 
-1. **Chatterbox TTS** (Resemble AI) synthesises natural-sounding speech from the text prompt. Optionally clones a reference voice from a short WAV clip.
-2. **Ditto** (Antgroup) animates the face photo in sync with the audio — lip movement, head pose, blinking.
+1. **Chatterbox TTS** (Resemble AI) synthesises natural speech from text. With a 5–20 s reference WAV/MP3, it **clones that voice**.
+2. **Ditto** (Antgroup) animates the face photo in sync with the audio — lip movement, head pose, blinking. PyTorch backend (no TensorRT compile step).
+3. The MP4 is base64-encoded and streamed back to the chat as an SSE event; the browser embeds it inline.
 
 | Property | Value |
 |---|---|
 | TTS model | `resemble-ai/chatterbox` |
-| Video model | `antgroup/ditto-talkinghead` (PyTorch backend) |
-| Face input | Single PNG/JPG — upload in chat or set `TALK_FACE_PATH` on server |
-| Voice cloning | Optional: set `TALK_VOICE_PATH` to a ~10 s reference WAV |
+| Video model | `antgroup/ditto-talkinghead` (PyTorch backend, ~5 GB checkpoints) |
+| Face input | Single PNG/JPG. Per-request via chat upload, or fallback `TALK_FACE_PATH` |
+| Voice cloning | 5–20 s reference WAV/MP3/MP4. Per-request via chat audio upload, or fallback `TALK_VOICE_PATH` |
 | Output | MP4 (duration matches the spoken text), played inline |
-| Generation time | ~3–5 min on a 20 GB MIG slice |
+| Generation time | ~1.5–2 min per 10 s of speech on a 20 GB MIG slice |
+| Practical prompt cap | ~80 words (~500 chars) — Chatterbox `max_new_tokens=1000` ≈ 40 s of audio |
 | Port | 8770 |
 
 ### Step 1 — Clone Ditto and create the conda env
 
-Ditto requires Python 3.10 + TensorRT 8.6.1 (or its ONNX fallback). It uses a separate env from the main chat service.
+Ditto uses a separate `ditto` env (Python 3.10) from the main `rag_gemma4` chat env. The two ship side-by-side under `~/sharedscratch/.conda/envs/`.
 
 ```bash
 # On the HPC head node:
@@ -613,6 +622,36 @@ conda env create -f environment.yaml    # creates env "ditto" with Python 3.10
 conda activate ditto
 pip install chatterbox-tts              # add TTS on top of the Ditto env
 ```
+
+> **CentOS 7 / glibc 2.17 caveat.** Ditto's stock `environment.yaml` pins `numpy=2.0.1` and assumes `onnxruntime-gpu>=1.18` — neither works on macleod1's glibc 2.17. After the conda env is created, install the following corrective dep set with `pip --no-deps` so torch/torchaudio versions stay locked:
+>
+> ```bash
+> # numpy back to 1.x — onnxruntime-gpu 1.16.3 is built against numpy 1.x
+> pip install --no-deps numpy==1.26.4
+>
+> # Ditto-side Python deps that environment.yaml leaves out for the PyTorch backend
+> pip install --no-deps \
+>   filetype==1.2.0 imageio==2.36.1 imageio-ffmpeg==0.5.1 \
+>   opencv-python-headless==4.10.0.84 scikit-image==0.25.0 scikit-learn==1.6.0 \
+>   tifffile==2024.12.12 numba==0.60.0 llvmlite==0.43.0 audioread==3.0.1 \
+>   cython==3.0.11 msgpack==1.1.0 cuda-python==12.6.2.post1 pooch==1.8.2 \
+>   joblib==1.4.2 lazy-loader==0.4 threadpoolctl==3.5.0 decorator==5.1.1 \
+>   platformdirs==4.3.6 polygraphy colored
+>
+> # GPU inference for Ditto's auxiliary models (face detect, landmarks)
+> # 1.16.3 is the last cp310 wheel that runs on glibc 2.17 (later ones need 2.28)
+> pip install --no-deps onnxruntime-gpu==1.16.3
+>
+> # mediapipe needs protobuf<5; onnx needs protobuf 4.x compatible interface
+> pip install --no-deps mediapipe==0.10.14 'protobuf>=4.21,<5'
+> pip install --no-deps onnx==1.16.2
+>
+> # matplotlib (mediapipe drawing utils import it) + pyparsing/cycler/etc.
+> pip install --no-deps matplotlib pyparsing cycler kiwisolver fonttools \
+>   contourpy python-dateutil attrs flatbuffers absl-py
+> ```
+>
+> The runtime also needs **GCC 14.2 libstdc++ (`CXXABI_1.3.15`)** for `soxr` and **bundled libsndfile 1.0.31** with its full codec chain (FLAC 8, vorbis, opus, ogg). The supplied `serve_ditto_talk.slurm` adds the GCC 14 lib64 path to `LD_LIBRARY_PATH` automatically. The codec libs are copied from `~/sharedscratch/.conda/pkgs/{libsndfile,libflac,libvorbis,libopus,libogg}*/lib/` into the env's `lib/` once during setup.
 
 ### Step 2 — Download Ditto checkpoints
 
@@ -633,6 +672,26 @@ scp -i ~/.ssh/macleod1_key face.png \
 ```
 
 Any clear front-facing photo works. The service falls back to `TALK_FACE_PATH` if no image is uploaded in the chat.
+
+### Step 3b — Voice cloning (optional)
+
+Chatterbox can clone any voice from a short clean speech clip. Two ways to wire this up:
+
+**Fixed server-side default** — every `/talk` uses this voice unless overridden:
+
+```bash
+# Convert a longer clip to a clean 12 s 24 kHz mono WAV
+conda activate ditto
+ffmpeg -y -ss 5 -t 12 -i ~/voice_source.mp3 \
+       -ac 1 -ar 24000 -c:a pcm_s16le \
+       ~/llm_experiments/voice_ref.wav
+
+# In serve_ditto_talk.slurm uncomment:
+#   export TALK_VOICE_PATH=/home/$USER/llm_experiments/voice_ref.wav
+# Then resubmit the job.
+```
+
+**Per-message override** — attach a 5–20 s audio clip in the chat alongside `/talk <text>`. The chat backend sends the bytes as `voice_ref` in the JSON request, the Ditto service writes it to a temp WAV and passes it to Chatterbox's `audio_prompt_path`. Overrides `TALK_VOICE_PATH` for that single message.
 
 ### Step 4 — Copy the service files and submit the job
 
@@ -676,13 +735,20 @@ export TALK_GEN_URL=http://<actual_node>:8770
 
 ### Step 6 — Use it from the chat UI
 
-**With a face photo uploaded:**
-1. Click the 📎 button and pick a face photo.
-2. Type `/talk Hello world, this is a talking head video.` and send.
+You can attach **a face photo and/or a voice clip** in the same message. The upload button accepts both, side-by-side, and the chat backend routes them to the right `/talk` fields.
 
-**With the server-side default face:**
+| Attached | Used for |
+|---|---|
+| nothing | Server default `TALK_FACE_PATH` and `TALK_VOICE_PATH` |
+| image only | Your face + server default voice |
+| audio only | Server default face + your voice (clone) |
+| image + audio | Your face + your voice |
+
+Examples:
+
 ```
 /talk Hello world, this is a talking head video.
+/talk Welcome to my channel — today we're testing voice cloning.
 ```
 
 You'll see **🎬 Generating with Ditto: …** in the status bubble, then the video inline.
@@ -693,7 +759,7 @@ You'll see **🎬 Generating with Ditto: …** in the status bubble, then the vi
 curl http://gpu02:8770/ready
 # → {"status":"ready"}
 
-# Generate with the server-side face:
+# Generate with the server-side face + default voice:
 curl -X POST http://gpu02:8770/generate \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"Hello, I am a talking head powered by Ditto and Chatterbox."}' \
@@ -704,6 +770,17 @@ d = json.load(sys.stdin)
 open('talk_test.mp4', 'wb').write(base64.b64decode(d['video']))
 print('Saved talk_test.mp4')
 "
+
+# Generate with a custom face + voice (both base64 in the JSON body):
+python - <<'PY'
+import base64, json, requests
+face  = base64.b64encode(open('face.png','rb').read()).decode()
+voice = base64.b64encode(open('voice_ref.wav','rb').read()).decode()
+r = requests.post('http://gpu02:8770/generate',
+    json={'prompt':'My face, my voice.', 'face_image':face, 'voice_ref':voice},
+    timeout=400)
+open('talk_custom.mp4','wb').write(base64.b64decode(r.json()['video']))
+PY
 ```
 
 ### Step 8 — Stopping the job
@@ -720,9 +797,10 @@ for j in $(squeue -u $USER -h -n ditto_talk -o %i); do scancel $j; done
 | Create env | `conda env create -f environment.yaml && conda activate ditto && pip install chatterbox-tts` |
 | Download checkpoints | `git clone https://huggingface.co/digital-avatar/ditto-talkinghead checkpoints` |
 | Copy face photo | `scp face.png t07an25@macleod1.abdn.ac.uk:~/llm_experiments/face.png` |
+| Trim a voice ref | `ffmpeg -ss 5 -t 12 -i src.mp3 -ac 1 -ar 24000 voice_ref.wav` |
 | Start service | `sbatch serve_ditto_talk.slurm` |
 | Check readiness | `curl http://gpu02:8770/ready` |
-| Use from chat | Upload face photo → `/talk <text>` |
+| Use from chat | Upload face + voice → `/talk <text>` |
 | Stop the job | `scancel <JOBID>` |
 
 ---
@@ -779,10 +857,10 @@ The `_model.generate(...)` call uses `max_new_tokens=1024`, `temperature=0.7`, `
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `message` | string | User text |
+| `message` | string | User text. Prefix with `/imageflux`, `/video`, or `/talk` to route to a generation service |
 | `history` | string | JSON array of `{role, content}` objects from the previous turns |
-| `image` | file | An image to send to Gemma 4 |
-| `audio` | file | An audio or video file to transcribe and analyse |
+| `image` | file | An image. Sent to Gemma 4 for vision, or used as the face for `/talk` |
+| `audio` | file | An audio or video file. Whisper-transcribed by default, or used as the voice reference when paired with `/talk` |
 
 **Response:** `text/event-stream`. Each event is a JSON object on a `data:` line:
 
@@ -871,6 +949,38 @@ All fields except `prompt` are optional.
 
 On OOM the service automatically retries with `num_frames=33` and adds `"note": "OOM on first attempt; fell back to 33 frames."` to the response.
 
+#### Talking-head service
+
+`ditto_talk_app.py` exposes:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/ready` | Returns `{"status": "ready"}` once both Chatterbox and Ditto are loaded |
+| `POST` | `/generate` | Generates one talking-head video clip |
+
+**POST `/generate` body (JSON):**
+
+```json
+{
+  "prompt": "Hello, this is a test of the Ditto talking head service.",
+  "face_image": "<base64 PNG/JPG>",   // optional — falls back to TALK_FACE_PATH
+  "voice_ref":  "<base64 WAV/MP3>",   // optional — falls back to TALK_VOICE_PATH
+  "exaggeration": 0.5,                  // 0 = neutral, 1 = highly expressive
+  "cfg_weight":   0.5                   // Chatterbox CFG weight
+}
+```
+
+**Response:**
+
+```json
+{
+  "video": "<base64-encoded MP4>",
+  "prompt": "Hello, this is a test of the Ditto talking head service."
+}
+```
+
+Requests are serialised by a `threading.Lock` — concurrent calls queue rather than fight for VRAM.
+
 ---
 
 ## How long audio is handled
@@ -919,6 +1029,36 @@ Gemma 4 is 15 GB. On a slow link this can take a while. Use `huggingface-cli` wi
 
 **The transcript is gibberish or wrong language**
 Whisper auto-detects language but mis-detects sometimes (e.g. low-volume background music, non-speech audio). Whisper does not transcribe music with no vocals — it will hallucinate. There is no fix in this app; that is a Whisper limitation.
+
+**`/talk` returns `TypeError: cannot unpack non-iterable NoneType object`**
+Ditto's face landmark detector returned `None` — the face in your photo is too small, partially occluded, or at an extreme angle. Use a clear front-facing portrait at least 256×256.
+
+**`/talk` returns `libsndfile.so: cannot open shared object file`**
+Compute nodes can't see the OS `libsndfile`. Copy a conda-bundled one into the env lib:
+```bash
+cp ~/sharedscratch/.conda/pkgs/libsndfile-1.0.31-h9c3ff4c_1/lib/libsndfile.so.1.0.31 \
+   ~/sharedscratch/.conda/envs/ditto/lib/
+# plus libFLAC.so.8, libvorbis.so.0.4.9, libvorbisenc.so.2.0.12, libopus.so.0, libogg.so.0
+# from the matching package dirs under ~/sharedscratch/.conda/pkgs/
+```
+
+**`/talk` returns `_ARRAY_API not found` (onnxruntime)**
+NumPy 2.x is incompatible with `onnxruntime-gpu 1.16.3` (the latest cp310 wheel that runs on glibc 2.17). Downgrade:
+```bash
+pip install --no-deps numpy==1.26.4
+```
+
+**`/talk` returns `'MessageFactory' object has no attribute 'GetPrototype'`**
+Protobuf 5.x conflict — `mediapipe<0.10.18` needs protobuf 4.x while modern `onnx` needs protobuf 5. Pin both:
+```bash
+pip install --no-deps 'protobuf>=4.21,<5' onnx==1.16.2
+```
+
+**`/talk` produces audio but the face barely moves**
+Use a higher-quality face photo with the head filling most of the frame. The default Ditto `overall_ctrl_info` has `delta_pitch=2` which is subtle — increase by passing `exaggeration` ≥ 0.7 in the request.
+
+**Voice cloning gives a robotic / unrelated voice**
+Reference clip too short, too noisy, or the wrong format. Aim for 8–15 seconds of clean speech, single speaker, no music, encoded as 24 kHz mono WAV (`ffmpeg -ac 1 -ar 24000`).
 
 **`cannot import name 'FLAX_WEIGHTS_NAME' from 'transformers.utils'`** (image-gen services)
 You have an older `diffusers` (≤ 0.31) paired with a newer `transformers` (≥ 5.x). Upgrade:
@@ -990,6 +1130,7 @@ llm_experiments/
 ├── ditto_talk_app.py          # Ditto + Chatterbox talking head microservice (port 8770)
 ├── serve_ditto_talk.slurm     # SLURM script for Ditto talking head
 ├── face.png                   # Default face image for /talk (SCP from local machine)
+├── voice_ref.wav              # Default voice clip for /talk cloning (optional, ~10 s)
 ├── logs/                      # SLURM output/error logs, one pair per job
 ├── ditto-talkinghead/         # Cloned antgroup/ditto-talkinghead repo
 │   └── checkpoints/           #   ~5 GB Ditto model weights
@@ -1000,7 +1141,7 @@ llm_experiments/
     $HF_HOME/hub/...           #   Flux (~24 GB) + Wan2.1 (~9 GB) + Chatterbox (~2 GB)
 ```
 
-The three services are completely independent — start, stop, and restart them on their own schedules. They communicate via plain HTTP on the cluster's internal network, not via shared memory or pipes.
+The four services (chat, Flux, Wan2.1 video, Ditto talking head) are completely independent — start, stop, and restart them on their own schedules. They communicate via plain HTTP on the cluster's internal network, not via shared memory or pipes. Each owns its own 20 GB MIG slice on the same A100 (`gpu02` on macleod1).
 
 The frontend (HTML, CSS, JavaScript) is embedded as a Python string at the top of `llm_chat_app.py`. There are no separate template or static directories. To change the UI, edit the `HTML` constant in that file.
 

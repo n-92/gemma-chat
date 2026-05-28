@@ -15,9 +15,15 @@ module load miniconda3 gcc/14.2.0
 source /opt/software/uoa/apps/miniconda3/etc/profile.d/conda.sh
 conda activate ditto
 
-TORCH_LIB=/home/t07an25/sharedscratch/.conda/envs/ditto/lib/python3.10/site-packages/torch/lib
-export LD_LIBRARY_PATH="$TORCH_LIB:$LD_LIBRARY_PATH"
-unset TORCH_LIB
+# GCC 14 lib64 must come first so soxr_ext finds CXXABI_1.3.15
+GCC14_LIB64=/opt/software/uoa/spk/0.23/linux-centos7-x86_64/gcc-12.1.0/gcc-14.2.0-cxb6tfeuf6d4j23lziof7ktzvyhjnek4/lib64
+CONDA_ENV_LIB=/home/t07an25/sharedscratch/.conda/envs/ditto/lib
+SITE=${CONDA_ENV_LIB}/python3.10/site-packages
+TORCH_LIB=${SITE}/torch/lib
+# Collect all nvidia CUDA runtime lib paths (cudnn, cublas, cufft, etc.)
+NVIDIA_LIBS=$(find ${SITE}/nvidia -maxdepth 3 -name "lib" -type d 2>/dev/null | tr '\n' ':')
+export LD_LIBRARY_PATH="${GCC14_LIB64}:${CONDA_ENV_LIB}:${TORCH_LIB}:${NVIDIA_LIBS}${LD_LIBRARY_PATH}"
+unset GCC14_LIB64 CONDA_ENV_LIB SITE TORCH_LIB NVIDIA_LIBS
 
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=4
@@ -47,7 +53,7 @@ export TALK_FACE_PATH=/home/t07an25/llm_experiments/face.png
 
 # ── Voice reference (optional) ────────────────────────────────────────────────
 # Uncomment to clone a specific voice from a ~10 s WAV clip:
-# export TALK_VOICE_PATH=/home/t07an25/llm_experiments/voice_ref.wav
+export TALK_VOICE_PATH=/home/t07an25/llm_experiments/voice_ref.wav
 
 echo "============================================================"
 echo "  Ditto Talking Head  |  Node: ${NODE}  |  Port: ${PORT}"
