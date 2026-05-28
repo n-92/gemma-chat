@@ -87,7 +87,6 @@ class StoryRequest(BaseModel):
     url: str | None = None
     text: str | None = None
     n_scenes: int = DEFAULT_SCENES
-    anonymize: bool = True
     mode: str = "render"                 # "storyboard" = preview only, "render" = full
     storyboard: list | None = None       # reuse an approved storyboard for render
     style: str | None = None             # global art style appended to every scene image
@@ -120,19 +119,16 @@ STORYBOARD_SYS = (
 )
 
 
-def storyboard_prompt(article: str, n_scenes: int, anonymize: bool) -> str:
-    privacy = (
-        "IMPORTANT: anonymise any private individual — never use a real person's "
-        "name or describe their face/photo. Refer to them by role (e.g. 'the student'). "
-        if anonymize else ""
-    )
+def storyboard_prompt(article: str, n_scenes: int) -> str:
     return (
         f"Article:\n\"\"\"\n{article[:8000]}\n\"\"\"\n\n"
-        f"Write a {n_scenes}-scene narrated storyboard. {privacy}"
-        "Keep the drama and tension of the original. Return a JSON array; each element:\n"
+        f"Write a {n_scenes}-scene narrated storyboard. "
+        "Tell the real story faithfully — use the actual names, places, and "
+        "specifics from the article. Keep the drama and tension of the original. "
+        "Return a JSON array; each element:\n"
         '  {"n": <int>, "narration": "<1-2 punchy spoken sentences>", '
         '"image_prompt": "<vivid VISUAL description for an image generator, '
-        'documentary/investigation-board style, no real faces or logos>"}\n'
+        'documentary/investigation-board style>"}\n'
         "Return ONLY the JSON array."
     )
 
@@ -145,10 +141,10 @@ def _extract_json_array(s: str) -> list:
     return json.loads(s[start:end + 1])
 
 
-async def make_storyboard(article: str, n_scenes: int, anonymize: bool) -> list:
+async def make_storyboard(article: str, n_scenes: int) -> list:
     payload = {
         "system": STORYBOARD_SYS,
-        "prompt": storyboard_prompt(article, n_scenes, anonymize),
+        "prompt": storyboard_prompt(article, n_scenes),
         "max_new_tokens": 1400,
     }
     async with httpx.AsyncClient(timeout=300.0) as c:
@@ -260,7 +256,7 @@ async def run_pipeline(req: StoryRequest):
     else:
         yield progress("storyboard", "Drafting storyboard (Gemma)…", pct=12)
         try:
-            storyboard = await make_storyboard(article, req.n_scenes, req.anonymize)
+            storyboard = await make_storyboard(article, req.n_scenes)
         except Exception as ex:
             yield sse({"error": f"Storyboard step failed: {type(ex).__name__}: {ex}"})
             return

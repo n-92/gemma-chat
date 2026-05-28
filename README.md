@@ -831,7 +831,7 @@ for j in $(squeue -u $USER -h -n ditto_talk -o %i); do scancel $j; done
 ```
 
 1. **Fetch** — pulls the URL and strips HTML to text (or you paste the text directly; HPC compute nodes often block outbound HTTP).
-2. **Storyboard** — Gemma 4's `/generate_text` returns a strict-JSON array of scenes, each with `narration` (1–2 spoken sentences) and an `image_prompt` (a vivid visual description). By default it **anonymises private individuals** — no real names or faces, people are referred to by role (e.g. "the student").
+2. **Storyboard** — Gemma 4's `/generate_text` returns a strict-JSON array of scenes, each with `narration` (1–2 spoken sentences) and an `image_prompt` (a vivid visual description). It tells the real story faithfully, using the actual names, places, and specifics from the article.
 3. **Voiceover** — each scene's narration goes to Chatterbox `/tts` on the Ditto service (the same default voice as `/talk`; see [Talking head](#talking-head-ditto--chatterbox)). If TTS is unavailable it falls back to a silent cut.
 4. **Images** — each `image_prompt` goes to Flux.1 `/generate`. The finished image is also sent to the browser immediately as a **thumbnail** so you see scenes appear one by one.
 5. **Render** — ffmpeg applies a slow **Ken-Burns zoom** (`zoompan`) to each still, sets the clip length to the scene's voiceover duration, then concatenates all clips into one MP4 (H.264 + AAC).
@@ -1141,7 +1141,6 @@ Requests are serialised by a `threading.Lock` — concurrent calls queue rather 
   "url": "https://example.com/article",   // optional — fetched + stripped to text
   "text": "Paste article text instead",   // optional — used if the node can't reach the URL
   "n_scenes": 8,                            // optional, default 8
-  "anonymize": true,                        // optional, default true — no real names/faces
   "mode": "render",                         // "storyboard" = preview only, "render" = full
   "storyboard": null,                       // optional — reuse an approved scene list
   "style": "watercolour storybook"          // optional — one art style applied to every scene

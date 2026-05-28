@@ -703,7 +703,7 @@ async def chat(
                 return
             # A leading http(s):// is treated as a URL to fetch; anything else is
             # treated as the article text pasted directly into the chat.
-            body = {"mode": mode, "anonymize": True}
+            body = {"mode": mode}
             if story_style:
                 body["style"] = story_style
             if re.match(r"^https?://", arg, re.I):
