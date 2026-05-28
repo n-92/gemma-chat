@@ -890,13 +890,15 @@ export STORY_GEN_URL=http://<actual_node>:8772
 ### Step 4 — Use it from the chat UI
 
 ```
-/storyboard https://example.com/some-article     # preview the scene list first
-/story      https://example.com/some-article     # full narrated video
-/story      Paste the whole article text here ... # if the node can't reach the URL
+/storyboard https://example.com/some-article              # preview the scene list first
+/story      https://example.com/some-article              # full narrated video
+/story      --style "watercolour storybook" https://...   # one art style across all scenes
+/story      Paste the whole article text here ...          # if the node can't reach the URL
 ```
 
 - **`/storyboard`** runs only steps 1–2 and stops at the scene list — fast, so you can sanity-check the narration before committing ~15 minutes to a render.
 - **`/story`** runs the whole pipeline. The progress bubble shows a checklist (`fetch → storyboard → voice → image → render`), a live percentage and ETA, and a thumbnail strip that fills in as each scene's image is generated.
+- **`--style "..."`** (optional) appends one art-style instruction to **every** scene's image prompt, so all scenes share a consistent look (e.g. `"watercolour storybook"`, `"noir comic"`, `"cinematic 3D render"`, `"oil painting"`). Quote multi-word styles; a single word can be unquoted (`--style noir`). The flag can go before or after the URL/text and is stripped out before fetching.
 
 If the URL can't be fetched from the compute node (outbound HTTP is often blocked), paste the article text after the command instead.
 
@@ -1141,7 +1143,8 @@ Requests are serialised by a `threading.Lock` — concurrent calls queue rather 
   "n_scenes": 8,                            // optional, default 8
   "anonymize": true,                        // optional, default true — no real names/faces
   "mode": "render",                         // "storyboard" = preview only, "render" = full
-  "storyboard": null                        // optional — reuse an approved scene list
+  "storyboard": null,                       // optional — reuse an approved scene list
+  "style": "watercolour storybook"          // optional — one art style applied to every scene
 }
 ```
 

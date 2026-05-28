@@ -213,7 +213,7 @@ HTML = r"""<!DOCTYPE html>
        <code>/video &lt;prompt&gt;</code> — generate a 5 s video clip (Wan2.1 1.3B, ~8 min).<br>
        <code>/talk &lt;text&gt;</code> — talking head video. Optionally attach a face photo and/or an audio clip (5-20 s) to clone that voice.<br>
        <code>/storyboard &lt;url|text&gt;</code> — preview the scene breakdown of an article (fast).<br>
-       <code>/story &lt;url|text&gt;</code> — full narrated visual story with live progress (~several min).</p>
+       <code>/story [--style "art style"] &lt;url|text&gt;</code> — full narrated visual story with live progress (~several min). Optional <code>--style</code> applies one look to every scene (e.g. <code>--style "watercolour storybook"</code>).</p>
   </div>
 </div>
 
@@ -689,12 +689,22 @@ async def chat(
 
         if story_cmd is not None:
             mode, arg = story_cmd
+            # Optional global art style: --style "watercolour storybook" (quoted,
+            # multi-word) or --style noir (single token). Applied to every scene's
+            # image prompt. Strip it out so what's left is the URL / article text.
+            story_style = None
+            m = re.search(r'--style\s+"([^"]+)"|--style\s+\'([^\']+)\'|--style\s+(\S+)', arg)
+            if m:
+                story_style = (m.group(1) or m.group(2) or m.group(3)).strip()
+                arg = (arg[:m.start()] + arg[m.end():]).strip()
             if not arg:
-                yield f'data: {json.dumps({"error": "Usage: /story <article URL or pasted text>"})}\n\n'
+                yield f'data: {json.dumps({"error": "Usage: /story [--style \\"art style\\"] <article URL or pasted text>"})}\n\n'
                 return
             # A leading http(s):// is treated as a URL to fetch; anything else is
             # treated as the article text pasted directly into the chat.
             body = {"mode": mode, "anonymize": True}
+            if story_style:
+                body["style"] = story_style
             if re.match(r"^https?://", arg, re.I):
                 body["url"] = arg
             else:

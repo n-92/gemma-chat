@@ -90,6 +90,7 @@ class StoryRequest(BaseModel):
     anonymize: bool = True
     mode: str = "render"                 # "storyboard" = preview only, "render" = full
     storyboard: list | None = None       # reuse an approved storyboard for render
+    style: str | None = None             # global art style appended to every scene image
 
 
 # ── Stage 1: get the article text ───────────────────────────────────────────
@@ -297,7 +298,13 @@ async def run_pipeline(req: StoryRequest):
         for i, sc in enumerate(storyboard, 1):
             yield progress("image", f"Generating image {i}/{n} (Flux)…",
                            step=i, total=n, pct=40 + int(40 * i / n))
-            data = await flux_scene(sc["image_prompt"])
+            # Option 1: one global art style applied uniformly to every scene,
+            # appended to whatever visual description Gemma wrote, so all N
+            # scenes share a consistent look.
+            scene_prompt = sc["image_prompt"]
+            if req.style:
+                scene_prompt = f"{scene_prompt}. Art style: {req.style}"
+            data = await flux_scene(scene_prompt)
             ip = work / f"scene_{i:02d}.png"
             if data:
                 ip.write_bytes(data)
