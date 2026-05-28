@@ -118,10 +118,61 @@ class TalkRequest(BaseModel):
     cfg_weight:   float = 0.5         # Chatterbox CFG weight
 
 
+class TTSRequest(BaseModel):
+    text:         str
+    voice_ref:    str | None = None   # base64 WAV/MP3; falls back to TALK_VOICE_PATH
+    exaggeration: float = 0.5
+    cfg_weight:   float = 0.5
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/ready")
 def ready():
     return {"status": "ready" if (_tts and _sdk) else "loading"}
+
+
+@app.post("/tts")
+async def tts(req: TTSRequest):
+    """Text → speech only (no talking-head video). Returns the raw Chatterbox
+    WAV so other services (e.g. the story orchestrator) can use voiceover.
+
+    Returns JSON: {"audio": "<base64-wav>", "sr": <int>}
+    """
+    if not _tts:
+        return JSONResponse({"error": "TTS not loaded yet"}, status_code=503)
+
+    loop = asyncio.get_event_loop()
+
+    def _run():
+        with _lock:
+            try:
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    tmp = Path(tmp_dir)
+                    if req.voice_ref:
+                        vref_path = tmp / "voice_ref.audio"
+                        vref_path.write_bytes(base64.b64decode(req.voice_ref))
+                        voice_ref = str(vref_path)
+                    else:
+                        voice_ref = TALK_VOICE_PATH or None
+                    wav_tensor = _tts.generate(
+                        req.text,
+                        audio_prompt_path=voice_ref,
+                        exaggeration=req.exaggeration,
+                        cfg_weight=req.cfg_weight,
+                    )
+                    wav_path = str(tmp / "tts.wav")
+                    torchaudio.save(wav_path, wav_tensor, _tts.sr)
+                    data = Path(wav_path).read_bytes()
+                    torch.cuda.empty_cache()
+                    return {"audio": base64.b64encode(data).decode(), "sr": _tts.sr}
+            except Exception as ex:
+                import traceback; print(traceback.format_exc(), flush=True)
+                return {"error": f"{type(ex).__name__}: {ex}"}
+
+    result = await loop.run_in_executor(None, _run)
+    if "error" in result:
+        return JSONResponse(result, status_code=500)
+    return result
 
 
 @app.post("/generate")

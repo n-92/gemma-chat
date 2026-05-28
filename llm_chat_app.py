@@ -3,14 +3,14 @@ Gemma 4 multimodal chat app.
 Supports text + image uploads + audio/video (via Whisper transcription), streaming responses.
 Run via serve_llm.slurm or: uvicorn llm_chat_app:app --port 8766
 """
-import asyncio, base64, io, json, os, tempfile, threading
+import asyncio, base64, io, json, os, re, tempfile, threading
 from pathlib import Path
 
 import httpx
 import torch
 import uvicorn
 import whisper as _whisper_lib
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import Body, FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from PIL import Image
@@ -24,6 +24,7 @@ PORT         = int(os.environ.get("PORT", 8766))
 FLUX_GEN_URL  = os.environ.get("FLUX_GEN_URL",  "http://gpu02:8768")   # Flux.1 schnell
 VIDEO_GEN_URL = os.environ.get("VIDEO_GEN_URL", "http://gpu02:8769")   # Wan2.1 1.3B
 TALK_GEN_URL  = os.environ.get("TALK_GEN_URL",  "http://gpu02:8770")   # Ditto + Chatterbox
+STORY_GEN_URL = os.environ.get("STORY_GEN_URL", "http://gpu02:8772")   # Visual-story orchestrator
 
 # System prompt prepended to every conversation. Override at runtime with
 # the SYSTEM_PROMPT env var (e.g. in serve_llm.slurm) or edit the default below.
@@ -210,7 +211,9 @@ HTML = r"""<!DOCTYPE html>
     <p>Send text, upload images, transcribe audio.<br>
        <code>/imageflux &lt;prompt&gt;</code> — generate an image (Flux.1 schnell, ~85s).<br>
        <code>/video &lt;prompt&gt;</code> — generate a 5 s video clip (Wan2.1 1.3B, ~8 min).<br>
-       <code>/talk &lt;text&gt;</code> — talking head video. Optionally attach a face photo and/or an audio clip (5-20 s) to clone that voice.</p>
+       <code>/talk &lt;text&gt;</code> — talking head video. Optionally attach a face photo and/or an audio clip (5-20 s) to clone that voice.<br>
+       <code>/storyboard &lt;url|text&gt;</code> — preview the scene breakdown of an article (fast).<br>
+       <code>/story &lt;url|text&gt;</code> — full narrated visual story with live progress (~several min).</p>
   </div>
 </div>
 
@@ -406,6 +409,84 @@ function appendGeneratedImage(dataUrl, prompt, model) {
   chat.scrollTop = chat.scrollHeight;
 }
 
+// ── Visual-story progress bubble ──────────────────────────────────────────
+// One bubble that mutates in place as the orchestrator streams events:
+//   progress  → stage list + bar + ETA + per-scene thumbnails
+//   storyboard→ expandable scene list (narration + image prompt)
+//   the final generated_video is rendered by appendGeneratedVideo()
+let storyEl = null;       // the live bubble's inner container
+let storyThumbs = [];     // accumulated scene thumbnails
+
+const STAGE_ORDER = ['init','fetch','storyboard','voice','image','render'];
+const STAGE_LABEL = { init:'Start', fetch:'Article', storyboard:'Storyboard',
+                      voice:'Narration', image:'Images', render:'Render' };
+
+function ensureStoryBubble() {
+  if (storyEl) return storyEl;
+  const chat = document.getElementById('chat');
+  const div = document.createElement('div');
+  div.className = 'msg ai';
+  div.innerHTML = `
+    <div class="avatar">📖</div>
+    <div class="bubble" style="min-width:280px">
+      <div style="font-size:.75rem;color:var(--text-dim);margin-bottom:8px;font-weight:600">📖 Building visual story…</div>
+      <div id="story-bar-wrap" style="background:var(--surface2);border-radius:6px;height:8px;overflow:hidden;margin-bottom:4px">
+        <div id="story-bar" style="height:100%;width:1%;background:linear-gradient(90deg,var(--accent),#a78bfa);transition:width .3s"></div>
+      </div>
+      <div id="story-eta" style="font-size:.7rem;color:var(--text-dim);margin-bottom:8px"></div>
+      <div id="story-stages" style="font-size:.8rem;line-height:1.7"></div>
+      <div id="story-thumbs" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:8px"></div>
+    </div>`;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  storyEl = div;
+  storyThumbs = [];
+  return div;
+}
+
+function updateStoryProgress(p) {
+  const el = ensureStoryBubble();
+  const bar = el.querySelector('#story-bar');
+  if (typeof p.pct === 'number') bar.style.width = Math.max(1, Math.min(100, p.pct)) + '%';
+  const eta = el.querySelector('#story-eta');
+  if (p.eta_s) eta.textContent = '~' + Math.ceil(p.eta_s / 60) + ' min left';
+  // Stage checklist — current stage shows its label, earlier stages get a tick
+  const curIdx = STAGE_ORDER.indexOf(p.stage);
+  const lines = STAGE_ORDER.map((s, i) => {
+    if (i < curIdx) return `<div>✓ ${STAGE_LABEL[s]}</div>`;
+    if (i === curIdx) return `<div style="color:var(--text)">⟳ ${esc(p.label || STAGE_LABEL[s])}`
+        + (p.total ? ` <span style="color:var(--text-dim)">(${p.step}/${p.total})</span>` : '') + `</div>`;
+    return `<div style="color:var(--text-dim)">· ${STAGE_LABEL[s]}</div>`;
+  });
+  el.querySelector('#story-stages').innerHTML = lines.join('');
+  if (p.thumb) {
+    storyThumbs.push(p.thumb);
+    el.querySelector('#story-thumbs').innerHTML =
+      storyThumbs.map(t => `<img src="${t}" style="width:48px;height:28px;object-fit:cover;border-radius:3px">`).join('');
+  }
+  document.getElementById('chat').scrollTop = document.getElementById('chat').scrollHeight;
+}
+
+function appendStoryboard(sb) {
+  const chat = document.getElementById('chat');
+  const div = document.createElement('div');
+  div.className = 'msg ai';
+  const rows = (sb.scenes || []).map(s =>
+    `<div style="margin:6px 0;padding:6px 8px;background:var(--surface2);border-radius:6px">
+       <div style="font-weight:600">Scene ${s.n}</div>
+       <div style="margin:2px 0">${esc(s.narration || '')}</div>
+       <div style="font-size:.75rem;color:var(--text-dim);font-style:italic">🎨 ${esc(s.image_prompt || '')}</div>
+     </div>`).join('');
+  div.innerHTML = `
+    <div class="avatar">🗂️</div>
+    <div class="bubble">
+      <div style="font-size:.75rem;color:var(--text-dim);margin-bottom:6px;font-weight:600">🗂️ Storyboard — ${sb.n} scenes</div>
+      ${rows}
+    </div>`;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
 function appendTyping() {
   const chat = document.getElementById('chat');
   const div = document.createElement('div');
@@ -438,6 +519,7 @@ async function send() {
   let typingEl = appendTyping();
   let aiTextEl = null;
   let fullText = '';
+  storyEl = null;   // start a fresh story-progress bubble for this turn
 
   const fd = new FormData();
   fd.append('message', text);
@@ -482,8 +564,18 @@ async function send() {
           typingEl = appendTyping();
           continue;
         }
+        if (data.progress) {
+          if (typingEl) { typingEl.remove(); typingEl = null; }
+          updateStoryProgress(data.progress);
+          continue;
+        }
+        if (data.storyboard) {
+          appendStoryboard(data.storyboard);
+          continue;
+        }
         if (data.generated_video) {
-          typingEl.remove();
+          if (typingEl) typingEl.remove();
+          if (storyEl) { storyEl = null; }   // finalise the live bubble
           appendGeneratedVideo(data.generated_video, data.prompt, data.model, data.num_frames);
           continue;
         }
@@ -526,6 +618,31 @@ def index():
 def ready():
     return {"ready": _model is not None}
 
+@app.post("/generate_text")
+async def generate_text(payload: dict = Body(...)):
+    """Single-shot text generation for internal services (e.g. the story
+    orchestrator's storyboard step). Reuses the already-loaded Gemma model
+    under the same inference lock as /chat."""
+    if _model is None:
+        return {"error": "Model not loaded yet"}
+    prompt = (payload.get("prompt") or "").strip()
+    system = (payload.get("system") or "").strip()
+    max_new = int(payload.get("max_new_tokens", 512))
+    if not prompt:
+        return {"error": "prompt is required"}
+    msgs = []
+    if system:
+        msgs.append({"role": "system", "content": [{"type": "text", "text": system}]})
+    msgs.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
+    loop = asyncio.get_event_loop()
+    try:
+        text = await loop.run_in_executor(
+            None, lambda: _generate_text_sync(msgs, max_new_tokens=max_new)
+        )
+        return {"text": text}
+    except Exception as ex:
+        return {"error": f"{type(ex).__name__}: {ex}"}
+
 @app.post("/chat")
 async def chat(
     message: str = Form(""),
@@ -559,6 +676,49 @@ async def chat(
         # /talk <text>         → Ditto talking head video (~3–5 min)
         #                        Attach a face photo to use your own face,
         #                        or set TALK_FACE_PATH on the server as fallback.
+        # ── /story | /storyboard — relay the orchestrator's SSE stream ────────
+        # Unlike the other slash commands (single POST → one result), the story
+        # pipeline is long and multi-stage, so we proxy its event stream line by
+        # line. Progress / storyboard / video events pass straight through to the
+        # browser, which is the whole point: live, granular progress.
+        story_cmd = None
+        if msg_text.lower().startswith("/storyboard "):
+            story_cmd = ("storyboard", msg_text[len("/storyboard "):].strip())
+        elif msg_text.lower().startswith("/story "):
+            story_cmd = ("render", msg_text[len("/story "):].strip())
+
+        if story_cmd is not None:
+            mode, arg = story_cmd
+            if not arg:
+                yield f'data: {json.dumps({"error": "Usage: /story <article URL or pasted text>"})}\n\n'
+                return
+            # A leading http(s):// is treated as a URL to fetch; anything else is
+            # treated as the article text pasted directly into the chat.
+            body = {"mode": mode, "anonymize": True}
+            if re.match(r"^https?://", arg, re.I):
+                body["url"] = arg
+            else:
+                body["text"] = arg
+            yield f'data: {json.dumps({"progress": {"stage": "init", "label": "Starting visual story…", "pct": 1}})}\n\n'
+            try:
+                async with httpx.AsyncClient(timeout=1800.0) as client:
+                    async with client.stream("POST", f"{STORY_GEN_URL}/story", json=body) as r:
+                        if r.status_code != 200:
+                            await r.aread()
+                            yield f'data: {json.dumps({"error": f"Story service error: {r.text[:200]}"})}\n\n'
+                            return
+                        async for line in r.aiter_lines():
+                            if line.startswith("data: "):
+                                yield line + "\n\n"
+                return
+            except httpx.ConnectError:
+                yield f'data: {json.dumps({"error": f"Story service unreachable at {STORY_GEN_URL}. Is its SLURM job running?"})}\n\n'
+                return
+            except Exception as ex:
+                import traceback; print(f'[Story error] {type(ex).__name__}: {ex}\n{traceback.format_exc()}', flush=True)
+                yield f'data: {json.dumps({"error": f"Story pipeline failed: {type(ex).__name__}: {ex}"})}\n\n'
+                return
+
         slash = None
         if msg_text.lower().startswith("/imageflux "):
             slash = ("flux",  FLUX_GEN_URL,  "Flux",   msg_text[len("/imageflux "):].strip())

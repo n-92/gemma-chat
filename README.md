@@ -20,11 +20,12 @@ It runs locally on any Linux/Windows/macOS machine with a CUDA-capable GPU, and 
 10. [Image generation: Flux.1 schnell](#image-generation-flux1-schnell)
 11. [Video generation: Wan2.1 1.3B](#video-generation-wan21-13b)
 12. [Talking head: Ditto + Chatterbox](#talking-head-ditto--chatterbox)
-13. [Configuration reference](#configuration-reference)
-14. [API endpoints](#api-endpoints)
-15. [How long audio is handled](#how-long-audio-is-handled)
-16. [Troubleshooting](#troubleshooting)
-17. [Project structure](#project-structure)
+13. [Visual storytelling: /storyboard and /story](#visual-storytelling-storyboard-and-story)
+14. [Configuration reference](#configuration-reference)
+15. [API endpoints](#api-endpoints)
+16. [How long audio is handled](#how-long-audio-is-handled)
+17. [Troubleshooting](#troubleshooting)
+18. [Project structure](#project-structure)
 
 ---
 
@@ -40,6 +41,7 @@ It runs locally on any Linux/Windows/macOS machine with a CUDA-capable GPU, and 
 - **Video generation** — `/video <prompt>` — 5-second clip using **Wan2.1 1.3B** (~8 min on a 20 GB MIG slice). Real CFG guidance means the model follows the prompt.
 - **Talking head video** — `/talk <text>` — upload a face photo (optional) and any voice clip (optional) then type what you want it to say. **Chatterbox TTS** synthesises the speech (with voice cloning if a clip is attached), **Ditto** animates the face in sync. (~3–5 min on a 20 GB MIG slice).
 - **Dual attachments per message** — attach a picture *and* an audio clip at the same time. With `/talk`, the picture is the face and the audio is the voice reference for cloning.
+- **Visual storytelling** — `/story <url|text>` turns an article into a narrated visual story: Gemma writes a scene-by-scene storyboard, Chatterbox voices each scene, Flux paints each scene, and ffmpeg adds a Ken-Burns motion pass and stitches the final MP4. `/storyboard <url|text>` previews just the scene list first. **Live, granular progress** — every stage and every scene streams a progress event (with per-scene thumbnails) so you watch the bubble fill in instead of staring at a spinner for ten minutes.
 - **GitHub-flavoured Markdown rendering** — headings, bullet/numbered lists, tables, blockquotes, code blocks, inline code, links, bold/italic. Sanitised with DOMPurify.
 - **Dark-themed responsive UI** — looks clean on desktop and mobile.
 - **Conversation history** — the browser keeps a rolling chat history (text only) and sends it back with each message for multi-turn context.
@@ -805,6 +807,133 @@ for j in $(squeue -u $USER -h -n ditto_talk -o %i); do scancel $j; done
 
 ---
 
+## Visual storytelling: /storyboard and /story
+
+`/story <url|text>` turns an article into a narrated visual story. It is an **orchestrator** — it owns no GPU and loads no model. Instead it fans out over HTTP to the three services you already run, then muxes the result with ffmpeg:
+
+```
+                              ┌────────────────────────────────┐
+                              │          story_app.py          │
+                              │      FastAPI · port 8772       │
+   /story <url|text>          │  (CPU-only orchestrator)       │
+  ┌────┐                      │                                │      ┌──────────────┐
+  │chat│ ── url or text ──────┼─▶ 1) fetch + clean article     │      │  Gemma 4     │
+  └────┘                      │   2) storyboard ───────────────┼─────▶│  :8766       │
+   port 8766                  │      (N scenes of JSON)         │◀─────│ /generate_text│
+   (llm_chat_app.py)          │   3) voiceover per scene ───────┼─────▶│  Chatterbox  │
+        ▲                     │                                 │◀─────│ :8770 /tts   │
+        │ progress events     │   4) image per scene ───────────┼─────▶│  Flux.1      │
+        │ (stage + thumbs)    │                                 │◀─────│ :8768 /generate│
+        │                     │   5) ffmpeg Ken-Burns + concat  │      └──────────────┘
+        │  generated_video    │   6) base64 MP4 ◀───────────────┤
+        └─────────────────────┤      + done                     │
+                              └────────────────────────────────┘
+```
+
+1. **Fetch** — pulls the URL and strips HTML to text (or you paste the text directly; HPC compute nodes often block outbound HTTP).
+2. **Storyboard** — Gemma 4's `/generate_text` returns a strict-JSON array of scenes, each with `narration` (1–2 spoken sentences) and an `image_prompt` (a vivid visual description). By default it **anonymises private individuals** — no real names or faces, people are referred to by role (e.g. "the student").
+3. **Voiceover** — each scene's narration goes to Chatterbox `/tts` on the Ditto service (the same default voice as `/talk`; see [Talking head](#talking-head-ditto--chatterbox)). If TTS is unavailable it falls back to a silent cut.
+4. **Images** — each `image_prompt` goes to Flux.1 `/generate`. The finished image is also sent to the browser immediately as a **thumbnail** so you see scenes appear one by one.
+5. **Render** — ffmpeg applies a slow **Ken-Burns zoom** (`zoompan`) to each still, sets the clip length to the scene's voiceover duration, then concatenates all clips into one MP4 (H.264 + AAC).
+6. The MP4 is base64-encoded and streamed back as a `generated_video` SSE event; the browser embeds it inline.
+
+| Property | Value |
+|---|---|
+| Storyboard model | Gemma 4 27B (reuses the running chat job — no extra GPU) |
+| Voice | Chatterbox TTS on the Ditto service (`TTS_URL/tts`) |
+| Images | Flux.1 schnell (`FLUX_URL/generate`) |
+| Render | ffmpeg `zoompan` Ken-Burns + concat demuxer → H.264/AAC MP4 |
+| Default scenes | 8 (override per request with `n_scenes`) |
+| Output resolution | 1280×720 @ 30 fps (`STORY_W` / `STORY_H` / `STORY_FPS`) |
+| Generation time | ~10–20 min for 8 scenes (script + 8 voiceovers + 8 images + render) |
+| GPU | **None** — CPU-only SLURM job; it only calls the other services |
+| Port | 8772 |
+
+> **ffmpeg encoder note.** The conda `ditto` env's ffmpeg 4.3 has **no GPL `libx264`**, and its bundled `libopenh264` has a library-version mismatch — neither produces browser-playable H.264. `story_app.py` therefore defaults `FFMPEG_BIN` to the **`imageio-ffmpeg` static binary** already inside the env (`.../imageio_ffmpeg/binaries/ffmpeg-linux64-v4.2.2`), which ships a working `libx264`. Override with `FFMPEG_BIN` / `STORY_VCODEC` if your build differs.
+
+### Step 1 — Prerequisites
+
+The orchestrator runs in the existing **`ditto`** conda env (it needs only `fastapi`, `uvicorn`, `httpx`, `pydantic`, and an ffmpeg with `libx264` — all already present). The **chat, Flux, and Ditto/Chatterbox services must all be up**, since the orchestrator calls them. The chat app must expose `/generate_text` (added alongside this feature).
+
+### Step 2 — Copy the service files and submit the job
+
+```bash
+# From your local machine:
+scp -i ~/.ssh/macleod1_key story_app.py \
+    t07an25@macleod1.abdn.ac.uk:~/llm_experiments/
+scp -i ~/.ssh/macleod1_key serve_story.slurm \
+    t07an25@macleod1.abdn.ac.uk:~/llm_experiments/
+```
+
+Then on the HPC:
+
+```bash
+cd ~/llm_experiments
+sbatch serve_story.slurm
+curl http://gpu02:8772/ready    # → {"ready": true}
+```
+
+`serve_story.slurm` is a **CPU-only** job (no `--gres`) pinned to `gpu02` so the chat app's hard-coded `http://gpu02:8772` resolves. It exports the upstream URLs (`GEMMA_URL`, `FLUX_URL`, `TTS_URL`) and the render settings (`STORY_W`, `STORY_H`, `STORY_FPS`).
+
+### Step 3 — Tell the chat app where the service lives
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `STORY_GEN_URL` | `http://gpu02:8772` | URL of the story orchestrator |
+
+If the job lands on a different node, add to `serve_llm.slurm`:
+
+```bash
+export STORY_GEN_URL=http://<actual_node>:8772
+```
+
+### Step 4 — Use it from the chat UI
+
+```
+/storyboard https://example.com/some-article     # preview the scene list first
+/story      https://example.com/some-article     # full narrated video
+/story      Paste the whole article text here ... # if the node can't reach the URL
+```
+
+- **`/storyboard`** runs only steps 1–2 and stops at the scene list — fast, so you can sanity-check the narration before committing ~15 minutes to a render.
+- **`/story`** runs the whole pipeline. The progress bubble shows a checklist (`fetch → storyboard → voice → image → render`), a live percentage and ETA, and a thumbnail strip that fills in as each scene's image is generated.
+
+If the URL can't be fetched from the compute node (outbound HTTP is often blocked), paste the article text after the command instead.
+
+### Step 5 — Test the service directly (optional)
+
+```bash
+curl http://gpu02:8772/ready
+# → {"ready": true}
+
+# Storyboard-only (fast), pasting text so no outbound HTTP is needed:
+curl -N -X POST http://gpu02:8772/story \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"<at least ~200 chars of article text>","mode":"storyboard","n_scenes":6}'
+# → a stream of `data: {...}` SSE frames ending in {"storyboard": {...}} and {"done": true}
+```
+
+### Step 6 — Stopping the job
+
+```bash
+for j in $(squeue -u $USER -h -n story_serve -o %i); do scancel $j; done
+```
+
+### Quick reference
+
+| Task | Command |
+|---|---|
+| Copy service files | `scp story_app.py serve_story.slurm t07an25@macleod1.abdn.ac.uk:~/llm_experiments/` |
+| Start service | `sbatch serve_story.slurm` |
+| Check readiness | `curl http://gpu02:8772/ready` |
+| Preview scenes | `/storyboard <url\|text>` |
+| Full render | `/story <url\|text>` |
+| Stop the job | `scancel <JOBID>` |
+
+> **Requires** the chat (8766), Flux (8768), and Ditto/Chatterbox (8770) services to be running.
+
+---
+
 ## Configuration reference
 
 All configuration is via environment variables:
@@ -818,6 +947,14 @@ All configuration is via environment variables:
 | `FLUX_GEN_URL` | `http://gpu02:8768` | chat | Where to find the Flux.1 schnell service |
 | `VIDEO_GEN_URL` | `http://gpu02:8769` | chat | Where to find the Wan2.1 1.3B video service |
 | `TALK_GEN_URL` | `http://gpu02:8770` | chat | Where to find the Ditto talking head service |
+| `STORY_GEN_URL` | `http://gpu02:8772` | chat | Where to find the visual-story orchestrator |
+| `GEMMA_URL` | `http://gpu02:8766` | story service | Chat app's `/generate_text` (storyboard) |
+| `FLUX_URL` | `http://gpu02:8768` | story service | Flux service `/generate` (per-scene image) |
+| `TTS_URL` | `http://gpu02:8770` | story service | Ditto service `/tts` (per-scene voiceover) |
+| `STORY_W` / `STORY_H` | `1280` / `720` | story service | Output video resolution |
+| `STORY_FPS` | `30` | story service | Output video frame rate |
+| `FFMPEG_BIN` | imageio-ffmpeg static binary | story service | ffmpeg with a working `libx264` (auto-detected) |
+| `STORY_VCODEC` / `STORY_VBITRATE` | `libx264` / `4M` | story service | Render codec and bitrate |
 | `TALK_FACE_PATH` | _(must be set)_ | ditto service | Path to fallback face image on the HPC |
 | `TALK_VOICE_PATH` | _(optional)_ | ditto service | Path to ~10 s reference WAV for voice cloning |
 | `DITTO_REPO` | `~/llm_experiments/ditto-talkinghead` | ditto service | Path to cloned Ditto repo |
@@ -857,7 +994,7 @@ The `_model.generate(...)` call uses `max_new_tokens=1024`, `temperature=0.7`, `
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `message` | string | User text. Prefix with `/imageflux`, `/video`, or `/talk` to route to a generation service |
+| `message` | string | User text. Prefix with `/imageflux`, `/video`, `/talk`, `/storyboard`, or `/story` to route to a generation service |
 | `history` | string | JSON array of `{role, content}` objects from the previous turns |
 | `image` | file | An image. Sent to Gemma 4 for vision, or used as the face for `/talk` |
 | `audio` | file | An audio or video file. Whisper-transcribed by default, or used as the voice reference when paired with `/talk` |
@@ -870,7 +1007,9 @@ The `_model.generate(...)` call uses `max_new_tokens=1024`, `temperature=0.7`, `
 | `{"transcript": "..."}` | Whisper's output, shown to the user as a separate bubble |
 | `{"text": "..."}` | A generation chunk to append to the assistant's response |
 | `{"generated_image": "data:image/png;base64,...", "prompt": "...", "model": "..."}` | A generated image to embed in the chat (from `/imageflux`) |
-| `{"generated_video": "<base64 MP4>", "prompt": "...", "model": "...", "num_frames": N, "fps": 16}` | A generated video to embed in the chat (from `/video`) |
+| `{"generated_video": "<base64 MP4>", "prompt": "...", "model": "...", "num_frames": N, "fps": 16}` | A generated video to embed in the chat (from `/video`, `/talk`, or `/story`) |
+| `{"progress": {"stage": "...", "label": "...", "step": N, "total": N, "pct": N, "eta_s": N, "thumb": "data:image/png;base64,..."}}` | Live story-pipeline progress (from `/story`); `thumb` present once a scene image is ready |
+| `{"storyboard": {"scenes": [...], "n": N}}` | The scene list (from `/storyboard` and `/story`) |
 | `{"error": "..."}` | Something went wrong; the UI shows it as an error bubble |
 | `{"done": true}` | End of stream |
 
@@ -957,6 +1096,7 @@ On OOM the service automatically retries with `num_frames=33` and adds `"note": 
 |--------|------|---------|
 | `GET` | `/ready` | Returns `{"status": "ready"}` once both Chatterbox and Ditto are loaded |
 | `POST` | `/generate` | Generates one talking-head video clip |
+| `POST` | `/tts` | Text → speech only (no video). Used by the story orchestrator for voiceover |
 
 **POST `/generate` body (JSON):**
 
@@ -979,7 +1119,33 @@ On OOM the service automatically retries with `num_frames=33` and adds `"note": 
 }
 ```
 
+**POST `/tts` body (JSON):** `{"text": "...", "voice_ref": "<base64 WAV/MP3>"?, "exaggeration": 0.5, "cfg_weight": 0.5}` → returns `{"audio": "<base64 WAV>", "sr": 24000}`. Like `/generate`, an omitted `voice_ref` falls back to `TALK_VOICE_PATH`.
+
 Requests are serialised by a `threading.Lock` — concurrent calls queue rather than fight for VRAM.
+
+#### Visual-story orchestrator
+
+`story_app.py` is a CPU-only orchestrator (no model, no GPU):
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/ready` | Returns `{"ready": true}` |
+| `POST` | `/story` | Streams the whole pipeline as SSE (`text/event-stream`) |
+
+**POST `/story` body (JSON):**
+
+```json
+{
+  "url": "https://example.com/article",   // optional — fetched + stripped to text
+  "text": "Paste article text instead",   // optional — used if the node can't reach the URL
+  "n_scenes": 8,                            // optional, default 8
+  "anonymize": true,                        // optional, default true — no real names/faces
+  "mode": "render",                         // "storyboard" = preview only, "render" = full
+  "storyboard": null                        // optional — reuse an approved scene list
+}
+```
+
+**Response:** `text/event-stream` of `data:` frames — `progress`, `storyboard`, `generated_video`, `error`, and `done` events (see the `/chat` SSE table above). The chat app relays these frames straight through to the browser.
 
 ---
 
@@ -1129,6 +1295,8 @@ llm_experiments/
 ├── serve_video_gen.slurm      # SLURM script for Wan2.1 video generation
 ├── ditto_talk_app.py          # Ditto + Chatterbox talking head microservice (port 8770)
 ├── serve_ditto_talk.slurm     # SLURM script for Ditto talking head
+├── story_app.py               # Visual-story orchestrator (CPU-only, port 8772)
+├── serve_story.slurm          # SLURM script for the story orchestrator
 ├── face.png                   # Default face image for /talk (SCP from local machine)
 ├── voice_ref.wav              # Default voice clip for /talk cloning (optional, ~10 s)
 ├── logs/                      # SLURM output/error logs, one pair per job
@@ -1141,7 +1309,7 @@ llm_experiments/
     $HF_HOME/hub/...           #   Flux (~24 GB) + Wan2.1 (~9 GB) + Chatterbox (~2 GB)
 ```
 
-The four services (chat, Flux, Wan2.1 video, Ditto talking head) are completely independent — start, stop, and restart them on their own schedules. They communicate via plain HTTP on the cluster's internal network, not via shared memory or pipes. Each owns its own 20 GB MIG slice on the same A100 (`gpu02` on macleod1).
+The services (chat, Flux, Wan2.1 video, Ditto talking head) are completely independent — start, stop, and restart them on their own schedules. They communicate via plain HTTP on the cluster's internal network, not via shared memory or pipes. Each owns its own 20 GB MIG slice on the same A100 (`gpu02` on macleod1). The visual-story orchestrator is the exception: it owns **no GPU** and simply fans out HTTP calls to the chat, Flux, and Ditto services, so it adds a feature without consuming another MIG slice.
 
 The frontend (HTML, CSS, JavaScript) is embedded as a Python string at the top of `llm_chat_app.py`. There are no separate template or static directories. To change the UI, edit the `HTML` constant in that file.
 
