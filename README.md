@@ -21,11 +21,12 @@ It runs locally on any Linux/Windows/macOS machine with a CUDA-capable GPU, and 
 11. [Video generation: Wan2.1 1.3B](#video-generation-wan21-13b)
 12. [Talking head: Ditto + Chatterbox](#talking-head-ditto--chatterbox)
 13. [Visual storytelling: /storyboard and /story](#visual-storytelling-storyboard-and-story)
-14. [Configuration reference](#configuration-reference)
-15. [API endpoints](#api-endpoints)
-16. [How long audio is handled](#how-long-audio-is-handled)
-17. [Troubleshooting](#troubleshooting)
-18. [Project structure](#project-structure)
+14. [Web search (automatic)](#web-search-automatic)
+15. [Configuration reference](#configuration-reference)
+16. [API endpoints](#api-endpoints)
+17. [How long audio is handled](#how-long-audio-is-handled)
+18. [Troubleshooting](#troubleshooting)
+19. [Project structure](#project-structure)
 
 ---
 
@@ -41,6 +42,7 @@ It runs locally on any Linux/Windows/macOS machine with a CUDA-capable GPU, and 
 - **Video generation** — `/video <prompt>` — 5-second clip using **Wan2.1 1.3B** (~8 min on a 20 GB MIG slice). Real CFG guidance means the model follows the prompt.
 - **Talking head video** — `/talk <text>` — upload a face photo (optional) and any voice clip (optional) then type what you want it to say. **Chatterbox TTS** synthesises the speech (with voice cloning if a clip is attached), **Ditto** animates the face in sync. (~3–5 min on a 20 GB MIG slice).
 - **Dual attachments per message** — attach a picture *and* an audio clip at the same time. With `/talk`, the picture is the face and the audio is the voice reference for cloning.
+- **Automatic web search** — Gemma decides per message whether a live web search would help (current events, recent facts, things it's unsure of), runs it, and answers **with inline citations** plus a clickable sources panel. Powered by [Tavily](https://tavily.com) (provider-agnostic). Force it with `/search <query>` or skip it with `(no search)`. See [Web search](#web-search-automatic).
 - **Visual storytelling** — `/story <url|text>` turns an article into a narrated visual story: Gemma writes a scene-by-scene storyboard, Chatterbox voices each scene, Flux paints each scene, and ffmpeg adds a Ken-Burns motion pass and stitches the final MP4. `/storyboard <url|text>` previews just the scene list first. **Live, granular progress** — every stage and every scene streams a progress event (with per-scene thumbnails) so you watch the bubble fill in instead of staring at a spinner for ten minutes.
 - **GitHub-flavoured Markdown rendering** — headings, bullet/numbered lists, tables, blockquotes, code blocks, inline code, links, bold/italic. Sanitised with DOMPurify.
 - **Dark-themed responsive UI** — looks clean on desktop and mobile.
@@ -63,7 +65,7 @@ It runs locally on any Linux/Windows/macOS machine with a CUDA-capable GPU, and 
 - **One inference at a time** — a `threading.Lock` serialises generation. Concurrent requests will queue.
 - **No image-to-image / inpainting** — only text-to-image generation. No ControlNet, no img2img, no editing of an uploaded image.
 - **No NSFW filtering or safety classifier** — the image and video services pass the raw model output through. Don't expose this to untrusted users.
-- **Gemma doesn't automatically call the image or video generator** — you have to type `/imageflux` or `/video` explicitly. There is no tool-calling that lets the model itself decide to generate media.
+- **Gemma doesn't automatically call the image or video generator** — you have to type `/imageflux` or `/video` explicitly. There is no tool-calling that lets the model itself decide to generate media. (Web search is the one exception: the model *does* decide to invoke that automatically — see [Web search](#web-search-automatic).)
 
 ---
 
@@ -939,6 +941,90 @@ for j in $(squeue -u $USER -h -n story_serve -o %i); do scancel $j; done
 
 ---
 
+## Web search (automatic)
+
+The chat app can ground its answers in live web results. Unlike the media commands, **this is automatic** — Gemma itself decides, per message, whether a search would help, runs it, and answers with citations. No special command needed for the common case.
+
+### How it works
+
+```
+your message
+     │
+     ▼
+┌─────────────────────────┐   "search?" + query
+│ decision step (Gemma)   │ ───────────────┐        a short, non-streaming Gemma call returns
+│ _plan_search_sync()     │                │        {"search": true, "query": "..."} or {"search": false}
+└─────────────────────────┘                ▼
+     │ no                          ┌──────────────────┐
+     │                            │ web_search()      │  POST https://api.tavily.com/search
+     ▼                            │ (Tavily / CSE)    │  → titles + snippets + URLs (+ summary)
+ answer directly                  └──────────────────┘
+                                            │ results injected into Gemma's context
+                                            ▼
+                                  streamed answer with inline [n] citations
+                                  + a clickable "Web sources" panel
+```
+
+1. **Decide** — `_plan_search_sync()` asks Gemma whether the message needs current/real-time info or specific facts it's unsure of. Returns a JSON verdict and a composed query. Pure reasoning/coding/math tasks return `{"search": false}` and skip straight to answering.
+2. **Search** — `web_search()` calls the configured provider and returns the top `SEARCH_MAX_RESULTS` results.
+3. **Answer** — the results are injected into the turn and Gemma streams a response, citing sources inline as `[n]` and listing the URLs used. A `🔎 Web sources` panel of clickable links renders before the answer.
+
+### Triggering
+
+| You type | Behaviour |
+|---|---|
+| a normal question needing current info (e.g. *"latest Claude model?"*) | Gemma **auto-searches**, answers with citations |
+| a reasoning/coding/math/transform task | answers directly, **no search** |
+| `/search <query>` | **forces** a search with that exact query |
+| any message containing `(no search)` | **suppresses** search, answers from memory only |
+
+Search is also skipped automatically for image-upload turns (vision questions) and whenever no provider key is configured.
+
+### Provider
+
+Provider-agnostic via `SEARCH_PROVIDER`:
+
+- **`tavily`** (default) — purpose-built for LLM/agent use; one API key (`tvly-…`), returns clean LLM-ready snippets plus an optional synthesised answer. Sign up at [tavily.com](https://tavily.com). Free tier ≈ 1,000 credits/month.
+- **`google`** — Google Custom Search JSON API (`key` + `cx`). ⚠️ Google's Custom Search JSON API is **closed to new projects**, so a fresh key will return `403 PERMISSION_DENIED`. This path is retained only for grandfathered keys; new deployments should use Tavily.
+
+### Credentials — kept out of the repo
+
+Keys are **never** hard-coded or committed. They live in a `600`-permission file in `$HOME` on the cluster and are sourced by `serve_llm.slurm`:
+
+```bash
+# ~/.gemma_secrets  (chmod 600 — never committed)
+export TAVILY_API_KEY=tvly-...
+# optional Google CSE fallback:
+# export GOOGLE_CSE_KEY=...
+# export GOOGLE_CSE_CX=...
+```
+
+```bash
+# serve_llm.slurm already contains:
+[ -f "$HOME/.gemma_secrets" ] && source "$HOME/.gemma_secrets"
+```
+
+Write it without exposing the key on the command line (args are visible to other users via `ps` on a shared cluster) — pipe it in over stdin:
+
+```bash
+printf 'export TAVILY_API_KEY=%s\n' 'tvly-YOURKEY' \
+  | ssh user@cluster 'umask 077; cat > ~/.gemma_secrets'
+```
+
+### Test it directly
+
+```bash
+curl -s -m 90 -N \
+  -F 'message=/search latest Anthropic Claude model' \
+  -F 'history=[]' \
+  http://gpu02:8766/chat
+# → data: {"status":"🔍 Searching the web: ..."}
+#   data: {"sources":[{"title":"...","url":"..."}, ...]}
+#   data: {"text":"..."}  (streamed, cited answer)
+```
+
+---
+
 ## Configuration reference
 
 All configuration is via environment variables:
@@ -953,6 +1039,10 @@ All configuration is via environment variables:
 | `VIDEO_GEN_URL` | `http://gpu02:8769` | chat | Where to find the Wan2.1 1.3B video service |
 | `TALK_GEN_URL` | `http://gpu02:8770` | chat | Where to find the Ditto talking head service |
 | `STORY_GEN_URL` | `http://gpu02:8772` | chat | Where to find the visual-story orchestrator |
+| `SEARCH_PROVIDER` | `tavily` | chat | Web-search backend: `tavily` or `google` |
+| `TAVILY_API_KEY` | _(from `~/.gemma_secrets`)_ | chat | Tavily API key (`tvly-…`). Enables automatic web search |
+| `SEARCH_MAX_RESULTS` | `5` | chat | Number of results fetched per search |
+| `GOOGLE_CSE_KEY` / `GOOGLE_CSE_CX` | _(optional)_ | chat | Google CSE fallback key + engine ID (API closed to new projects) |
 | `GEMMA_URL` | `http://gpu02:8766` | story service | Chat app's `/generate_text` (storyboard) |
 | `FLUX_URL` | `http://gpu02:8768` | story service | Flux service `/generate` (per-scene image) |
 | `TTS_URL` | `http://gpu02:8770` | story service | Ditto service `/tts` (per-scene voiceover) |
@@ -999,7 +1089,7 @@ The `_model.generate(...)` call uses `max_new_tokens=1024`, `temperature=0.7`, `
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `message` | string | User text. Prefix with `/imageflux`, `/video`, `/talk`, `/storyboard`, or `/story` to route to a generation service |
+| `message` | string | User text. Prefix with `/imageflux`, `/video`, `/talk`, `/storyboard`, or `/story` to route to a generation service; `/search <query>` forces a web search, `(no search)` suppresses one |
 | `history` | string | JSON array of `{role, content}` objects from the previous turns |
 | `image` | file | An image. Sent to Gemma 4 for vision, or used as the face for `/talk` |
 | `audio` | file | An audio or video file. Whisper-transcribed by default, or used as the voice reference when paired with `/talk` |
@@ -1010,6 +1100,7 @@ The `_model.generate(...)` call uses `max_new_tokens=1024`, `temperature=0.7`, `
 |-------|---------|
 | `{"status": "..."}` | Live progress update for the typing bubble (transcribing, summarising, generating image, …) |
 | `{"transcript": "..."}` | Whisper's output, shown to the user as a separate bubble |
+| `{"sources": [{"title": "...", "url": "..."}, ...]}` | Web-search results used to ground the answer; rendered as a clickable sources panel |
 | `{"text": "..."}` | A generation chunk to append to the assistant's response |
 | `{"generated_image": "data:image/png;base64,...", "prompt": "...", "model": "..."}` | A generated image to embed in the chat (from `/imageflux`) |
 | `{"generated_video": "<base64 MP4>", "prompt": "...", "model": "...", "num_frames": N, "fps": 16}` | A generated video to embed in the chat (from `/video`, `/talk`, or `/story`) |
@@ -1306,6 +1397,7 @@ llm_experiments/
 ├── face.png                   # Default face image for /talk (SCP from local machine)
 ├── voice_ref.wav              # Default voice clip for /talk cloning (optional, ~10 s)
 ├── logs/                      # SLURM output/error logs, one pair per job
+│   # (not in repo) ~/.gemma_secrets  chmod 600 — web-search API keys, sourced by serve_llm.slurm
 ├── ditto-talkinghead/         # Cloned antgroup/ditto-talkinghead repo
 │   └── checkpoints/           #   ~5 GB Ditto model weights
 ├── README.md                  # This file

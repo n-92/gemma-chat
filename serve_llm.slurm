@@ -41,6 +41,10 @@ PORT=8766
 export MODEL_PATH=/scratch/users/t07an25/llm_experiments/gemma4
 export PORT=$PORT
 
+# Web-search skill credentials (TAVILY_API_KEY / GOOGLE_CSE_*). Kept out of the
+# repo — sourced from a 600-perm file in $HOME so keys never touch git or argv.
+[ -f "$HOME/.gemma_secrets" ] && source "$HOME/.gemma_secrets"
+
 echo "============================================================"
 echo "  Gemma 4 Chat  |  Node: ${NODE}  |  Port: ${PORT}"
 echo "  ssh -L ${PORT}:${NODE}:${PORT} t07an25@macleod1.abdn.ac.uk -N"

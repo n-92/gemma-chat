@@ -26,6 +26,19 @@ VIDEO_GEN_URL = os.environ.get("VIDEO_GEN_URL", "http://gpu02:8769")   # Wan2.1 
 TALK_GEN_URL  = os.environ.get("TALK_GEN_URL",  "http://gpu02:8770")   # Ditto + Chatterbox
 STORY_GEN_URL = os.environ.get("STORY_GEN_URL", "http://gpu02:8772")   # Visual-story orchestrator
 
+# ── Web-search skill (agentic) ────────────────────────────────────────────────
+# Gemma decides, per message, whether a live web search would improve its answer,
+# runs it, and answers with citations. Keys come from ~/.gemma_secrets (sourced in
+# serve_llm.slurm) — never hard-coded. Provider-agnostic: Tavily (default) or Google
+# CSE. Note: Google's Custom Search JSON API is closed to new projects, so Tavily is
+# the working default; the Google path is kept only for any grandfathered key.
+SEARCH_PROVIDER    = os.environ.get("SEARCH_PROVIDER", "tavily").lower()
+TAVILY_API_KEY     = os.environ.get("TAVILY_API_KEY", "")
+GOOGLE_CSE_KEY     = os.environ.get("GOOGLE_CSE_KEY", "")
+GOOGLE_CSE_CX      = os.environ.get("GOOGLE_CSE_CX", "")
+SEARCH_MAX_RESULTS = int(os.environ.get("SEARCH_MAX_RESULTS", 5))
+WEB_SEARCH_ENABLED = bool(TAVILY_API_KEY or (GOOGLE_CSE_KEY and GOOGLE_CSE_CX))
+
 # System prompt prepended to every conversation. Override at runtime with
 # the SYSTEM_PROMPT env var (e.g. in serve_llm.slurm) or edit the default below.
 SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT", (
@@ -85,6 +98,77 @@ def _generate_text_sync(msgs: list, max_new_tokens: int = 256) -> str:
             )
         prompt_len = inputs["input_ids"].shape[1]
         return _processor.tokenizer.decode(out_ids[0][prompt_len:], skip_special_tokens=True)
+
+
+# ── Web-search skill ───────────────────────────────────────────────────────────
+async def web_search(query: str, max_results: int = SEARCH_MAX_RESULTS) -> dict:
+    """Provider-agnostic web search.
+    Returns {"answer": str|None, "results": [{"title","url","snippet"}]} or {"error": str}."""
+    try:
+        if SEARCH_PROVIDER == "tavily" and TAVILY_API_KEY:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.post(
+                    "https://api.tavily.com/search",
+                    headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
+                    json={"query": query, "search_depth": "basic",
+                          "include_answer": True, "max_results": max_results},
+                )
+            r.raise_for_status()
+            d = r.json()
+            return {
+                "answer": d.get("answer"),
+                "results": [{"title": it.get("title"), "url": it.get("url"),
+                             "snippet": (it.get("content") or "")[:500]}
+                            for it in (d.get("results") or [])[:max_results]],
+            }
+        if SEARCH_PROVIDER == "google" and GOOGLE_CSE_KEY and GOOGLE_CSE_CX:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.get(
+                    "https://www.googleapis.com/customsearch/v1",
+                    params={"key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_CX,
+                            "q": query, "num": max_results},
+                )
+            r.raise_for_status()
+            d = r.json()
+            return {
+                "answer": None,
+                "results": [{"title": it.get("title"), "url": it.get("link"),
+                             "snippet": (it.get("snippet") or "")}
+                            for it in (d.get("items") or [])[:max_results]],
+            }
+        return {"error": "no search provider configured"}
+    except Exception as ex:
+        return {"error": f"{type(ex).__name__}: {ex}"}
+
+
+def _plan_search_sync(user_text: str) -> dict:
+    """Ask Gemma whether the latest message needs a live web search, and if so what to
+    query. Returns {"search": bool, "query": str}. One short non-streaming call."""
+    instr = (
+        "Decide whether answering the user's message would materially benefit from a live "
+        "web search. Search for: current events, real-time or recent information, "
+        "fast-changing facts, or specific details you are not confident about. "
+        "Do NOT search for: general knowledge, reasoning, math, coding, or text "
+        "transformation tasks.\n\n"
+        f"User message:\n{user_text}\n\n"
+        'Respond with ONLY a single-line JSON object and nothing else: '
+        '{"search": true, "query": "<concise web search query>"} or {"search": false}.'
+    )
+    msgs = [{"role": "user", "content": [{"type": "text", "text": instr}]}]
+    try:
+        raw = _generate_text_sync(msgs, max_new_tokens=80).strip()
+    except Exception as ex:
+        print(f"[search plan] generation failed: {ex}", flush=True)
+        return {"search": False, "query": user_text}
+    m = re.search(r"\{.*\}", raw, re.S)
+    if not m:
+        return {"search": False, "query": user_text}
+    try:
+        d = json.loads(m.group(0))
+        return {"search": bool(d.get("search")),
+                "query": (d.get("query") or user_text).strip()}
+    except Exception:
+        return {"search": False, "query": user_text}
 
 
 @app.on_event("startup")
@@ -208,7 +292,7 @@ HTML = r"""<!DOCTYPE html>
   <div id="welcome">
     <div class="big">✦</div>
     <h2>Gemma 4 Multimodal Chat</h2>
-    <p>Send text, upload images, transcribe audio.<br>
+    <p>Send text, upload images, transcribe audio. <strong>Gemma searches the web automatically</strong> when a question needs current info, and answers with citations — force it with <code>/search &lt;query&gt;</code> or skip it by adding <code>(no search)</code>.<br>
        <code>/imageflux &lt;prompt&gt;</code> — generate an image (Flux.1 schnell, ~85s).<br>
        <code>/video &lt;prompt&gt;</code> — generate a 5 s video clip (Wan2.1 1.3B, ~8 min).<br>
        <code>/talk &lt;text&gt;</code> — talking head video. Optionally attach a face photo and/or an audio clip (5-20 s) to clone that voice.<br>
@@ -352,6 +436,26 @@ function appendMsg(role, text, imgUrl, audUrl, audName) {
   chat.appendChild(div);
   chat.scrollTop = chat.scrollHeight;
   return div.querySelector('.text-content');
+}
+
+function appendSources(sources) {
+  const welcome = document.getElementById('welcome');
+  if (welcome) welcome.remove();
+  const chat = document.getElementById('chat');
+  const div = document.createElement('div');
+  div.className = 'msg ai';
+  const items = (sources || []).map((s, i) =>
+    `<a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer" `
+    + `style="color:#6ea8fe;text-decoration:none">[${i + 1}] ${esc(s.title || s.url)}</a>`
+  ).join('<br>');
+  div.innerHTML = `
+    <div class="avatar">🔎</div>
+    <div class="bubble" style="font-size:.8rem">
+      <div style="color:var(--text-dim);margin-bottom:4px">Web sources</div>
+      ${items}
+    </div>`;
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
 }
 
 function appendTranscript(transcript) {
@@ -552,9 +656,18 @@ async function send() {
           return;
         }
         if (data.status) {
-          const icon = data.status.startsWith('Summarising') ? '🧩' : '🎙️';
+          const icon = data.status.startsWith('🔍') ? ''
+                     : data.status.startsWith('Summarising') ? '🧩'
+                     : '🎙️';
           typingEl.querySelector('.bubble').innerHTML =
             `<span style="font-size:.8rem;color:var(--text-dim)">${icon} ${esc(data.status)}</span>`;
+          continue;
+        }
+        if (data.sources) {
+          appendSources(data.sources);
+          // refresh the typing indicator so Gemma's answer follows the sources
+          if (typingEl) typingEl.remove();
+          typingEl = appendTyping();
           continue;
         }
         if (data.transcript) {
@@ -666,6 +779,20 @@ async def chat(
         hist = json.loads(history)
     except Exception:
         hist = []
+
+    # ── Web-search overrides (parsed before generation) ──────────────────────
+    # force_search: True  → always search (e.g. "/search <q>")
+    #               False → never search (e.g. message contains "(no search)")
+    #               None  → let Gemma decide automatically
+    force_search = None
+    search_query_override = None
+    if msg_text.lower().startswith("/search "):
+        force_search = True
+        search_query_override = msg_text[len("/search "):].strip()
+        msg_text = search_query_override            # the query is also the question
+    elif re.search(r"\((?:no\s+search|don'?t\s+search)\)", msg_text, re.I):
+        force_search = False
+        msg_text = re.sub(r"\((?:no\s+search|don'?t\s+search)\)", "", msg_text, flags=re.I).strip()
 
     async def stream_response():
         loop = asyncio.get_event_loop()
@@ -874,6 +1001,44 @@ async def chat(
 
         if combined_text:
             content.append({"type": "text", "text": combined_text})
+
+        # ── Web-search skill (agentic) ───────────────────────────────────────
+        # Decide → search → inject results so the streamed answer is grounded and
+        # cited. Skipped for image turns (vision questions) and when no provider
+        # is configured. force_search short-circuits the decision step.
+        if WEB_SEARCH_ENABLED and msg_text and not image_bytes:
+            do_search = force_search
+            query = search_query_override or msg_text
+            if do_search is None:
+                plan = await loop.run_in_executor(None, lambda: _plan_search_sync(msg_text))
+                do_search = plan.get("search", False)
+                query = plan.get("query") or msg_text
+            if do_search:
+                _s = json.dumps({"status": f"🔍 Searching the web: {query[:80]}"})
+                yield f"data: {_s}\n\n"
+                res = await web_search(query)
+                if "error" in res:
+                    note = str(res["error"])[:100]
+                    _s = json.dumps({"status": f"🔍 Web search unavailable ({note}) — answering from memory"})
+                    yield f"data: {_s}\n\n"
+                else:
+                    results = res.get("results") or []
+                    if results:
+                        _src = json.dumps({"sources": [{"title": r["title"], "url": r["url"]} for r in results]})
+                        yield f"data: {_src}\n\n"
+                        parts = []
+                        if res.get("answer"):
+                            parts.append(f"Search summary: {res['answer']}")
+                        for i, r in enumerate(results, 1):
+                            parts.append(f"[{i}] {r['title']}\n{r['url']}\n{r['snippet']}")
+                        joined = "\n\n".join(parts)
+                        search_block = (
+                            f'[WEB SEARCH RESULTS for "{query}"]\n\n{joined}\n\n'
+                            "Answer the user's question using these results. Cite sources inline "
+                            "as [n] and list the URLs you used at the end. If the results are not "
+                            "relevant, say so briefly and answer from your own knowledge."
+                        )
+                        content.append({"type": "text", "text": search_block})
 
         if not content:
             yield f'data: {json.dumps({"done": True})}\n\n'
