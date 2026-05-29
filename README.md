@@ -844,7 +844,7 @@ for j in $(squeue -u $USER -h -n ditto_talk -o %i); do scancel $j; done
 | Images | Flux.1 schnell (`FLUX_URL/generate`) |
 | Render | ffmpeg `zoompan` Ken-Burns + concat demuxer → H.264/AAC MP4 |
 | Default scenes | 8 (override per request with `n_scenes`) |
-| Output resolution | 1280×720 @ 30 fps (`STORY_W` / `STORY_H` / `STORY_FPS`) |
+| Output resolution | 1280×720 @ 30 fps default; `--vertical` 1080×1920, `--aspect 1:1` 1080×1080, `4:5` 1080×1350 |
 | Generation time | ~10–20 min for 8 scenes (script + 8 voiceovers + 8 images + render) |
 | GPU | **None** — CPU-only SLURM job; it only calls the other services |
 | Port | 8772 |
@@ -891,14 +891,17 @@ export STORY_GEN_URL=http://<actual_node>:8772
 
 ```
 /storyboard https://example.com/some-article              # preview the scene list first
-/story      https://example.com/some-article              # full narrated video
+/story      https://example.com/some-article              # full narrated video (16:9)
 /story      --style "watercolour storybook" https://...   # one art style across all scenes
+/story      --vertical https://...                         # 9:16 Instagram/Reels portrait
+/story      --aspect 1:1 https://...                       # square (1:1), also 4:5 / 16:9
 /story      Paste the whole article text here ...          # if the node can't reach the URL
 ```
 
 - **`/storyboard`** runs only steps 1–2 and stops at the scene list — fast, so you can sanity-check the narration before committing ~15 minutes to a render.
 - **`/story`** runs the whole pipeline. The progress bubble shows a checklist (`fetch → storyboard → voice → image → render`), a live percentage and ETA, and a thumbnail strip that fills in as each scene's image is generated.
 - **`--style "..."`** (optional) appends one art-style instruction to **every** scene's image prompt, so all scenes share a consistent look (e.g. `"watercolour storybook"`, `"noir comic"`, `"cinematic 3D render"`, `"oil painting"`). Quote multi-word styles; a single word can be unquoted (`--style noir`). The flag can go before or after the URL/text and is stripped out before fetching.
+- **`--vertical` / `--aspect <ratio>`** (optional) sets the output shape. Default is `16:9` landscape (1280×720). `--vertical` (alias for `--aspect 9:16`) renders 1080×1920 portrait for Instagram Reels / TikTok / Stories; `--aspect 1:1` gives 1080×1080 square; `--aspect 4:5` gives 1080×1350. The aspect drives **both** the video canvas *and* the Flux image dimensions, so scenes are composed for the chosen shape rather than centre-cropped from a square.
 
 If the URL can't be fetched from the compute node (outbound HTTP is often blocked), paste the article text after the command instead.
 
@@ -1143,7 +1146,8 @@ Requests are serialised by a `threading.Lock` — concurrent calls queue rather 
   "n_scenes": 8,                            // optional, default 8
   "mode": "render",                         // "storyboard" = preview only, "render" = full
   "storyboard": null,                       // optional — reuse an approved scene list
-  "style": "watercolour storybook"          // optional — one art style applied to every scene
+  "style": "watercolour storybook",         // optional — one art style applied to every scene
+  "aspect": "9:16"                          // optional — 16:9 (default), 9:16, 1:1, or 4:5
 }
 ```
 

@@ -213,7 +213,7 @@ HTML = r"""<!DOCTYPE html>
        <code>/video &lt;prompt&gt;</code> — generate a 5 s video clip (Wan2.1 1.3B, ~8 min).<br>
        <code>/talk &lt;text&gt;</code> — talking head video. Optionally attach a face photo and/or an audio clip (5-20 s) to clone that voice.<br>
        <code>/storyboard &lt;url|text&gt;</code> — preview the scene breakdown of an article (fast).<br>
-       <code>/story [--style "art style"] &lt;url|text&gt;</code> — full narrated visual story with live progress (~several min). Optional <code>--style</code> applies one look to every scene (e.g. <code>--style "watercolour storybook"</code>).</p>
+       <code>/story [--style "art style"] [--vertical] &lt;url|text&gt;</code> — full narrated visual story with live progress (~several min). Optional <code>--style</code> applies one look to every scene (e.g. <code>--style "watercolour storybook"</code>); <code>--vertical</code> (or <code>--aspect 9:16</code>) renders Instagram/Reels portrait.</p>
   </div>
 </div>
 
@@ -697,8 +697,19 @@ async def chat(
             if m:
                 story_style = (m.group(1) or m.group(2) or m.group(3)).strip()
                 arg = (arg[:m.start()] + arg[m.end():]).strip()
+            # Optional aspect ratio: --aspect 9:16 (or 1:1 / 4:5 / 16:9), or the
+            # shorthand --vertical for 9:16 Instagram/Reels/TikTok format.
+            story_aspect = None
+            ma = re.search(r'--aspect\s+(\S+)', arg)
+            if ma:
+                story_aspect = ma.group(1).strip()
+                arg = (arg[:ma.start()] + arg[ma.end():]).strip()
+            mv = re.search(r'(?:^|\s)--vertical(?:\s|$)', arg)
+            if mv:
+                story_aspect = story_aspect or "9:16"
+                arg = (arg[:mv.start()] + " " + arg[mv.end():]).strip()
             if not arg:
-                _usage = json.dumps({"error": 'Usage: /story [--style "art style"] <article URL or pasted text>'})
+                _usage = json.dumps({"error": 'Usage: /story [--style "art style"] [--aspect 9:16|1:1|4:5] [--vertical] <article URL or pasted text>'})
                 yield f"data: {_usage}\n\n"
                 return
             # A leading http(s):// is treated as a URL to fetch; anything else is
@@ -706,6 +717,8 @@ async def chat(
             body = {"mode": mode}
             if story_style:
                 body["style"] = story_style
+            if story_aspect:
+                body["aspect"] = story_aspect
             if re.match(r"^https?://", arg, re.I):
                 body["url"] = arg
             else:

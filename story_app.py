@@ -90,6 +90,26 @@ class StoryRequest(BaseModel):
     mode: str = "render"                 # "storyboard" = preview only, "render" = full
     storyboard: list | None = None       # reuse an approved storyboard for render
     style: str | None = None             # global art style appended to every scene image
+    aspect: str | None = None            # "16:9" (default), "9:16", "1:1", "4:5"
+
+
+# Per-aspect dimensions: (video_w, video_h, flux_img_w, flux_img_h).
+# Flux dims share the aspect and sit near the ~1 MP budget that the 20 GB MIG
+# slice handles comfortably; ffmpeg then scales each still up to the video size.
+def resolve_dims(aspect: str | None):
+    a = (aspect or "16:9").replace(" ", "").lower()
+    table = {
+        "9:16":     (1080, 1920, 768, 1344),
+        "vertical": (1080, 1920, 768, 1344),
+        "portrait": (1080, 1920, 768, 1344),
+        "reel":     (1080, 1920, 768, 1344),
+        "1:1":      (1080, 1080, 1024, 1024),
+        "square":   (1080, 1080, 1024, 1024),
+        "4:5":      (1080, 1350, 896, 1120),
+    }
+    if a in table:
+        return table[a]
+    return (VID_W, VID_H, VID_W, VID_H)   # 16:9 / default → env STORY_W/STORY_H
 
 
 # ── Stage 1: get the article text ───────────────────────────────────────────
@@ -179,10 +199,11 @@ async def tts_scene(text: str) -> bytes | None:
         return None
 
 
-async def flux_scene(prompt: str) -> bytes | None:
+async def flux_scene(prompt: str, width: int = 1024, height: int = 1024) -> bytes | None:
     try:
         async with httpx.AsyncClient(timeout=300.0) as c:
-            r = await c.post(f"{FLUX_URL}/generate", json={"prompt": prompt})
+            r = await c.post(f"{FLUX_URL}/generate",
+                             json={"prompt": prompt, "width": width, "height": height})
         if r.status_code != 200:
             return None
         img = r.json().get("image", "")
@@ -203,13 +224,14 @@ def wav_duration(path: Path) -> float:
 
 # ── Stage 4: ffmpeg render (Ken-Burns per scene, then concat) ────────────────
 def render_scene_clip(img_path: Path, wav_path: Path | None,
-                      out_path: Path, dur: float) -> None:
+                      out_path: Path, dur: float,
+                      vid_w: int = VID_W, vid_h: int = VID_H) -> None:
     """One still → a slowly zooming clip of length `dur`, with audio if present."""
     nframes = max(1, int(dur * FPS))
     vf = (
-        f"scale={VID_W}:{VID_H}:force_original_aspect_ratio=increase,"
-        f"crop={VID_W}:{VID_H},"
-        f"zoompan=z='min(zoom+0.0006,1.15)':d={nframes}:s={VID_W}x{VID_H}:fps={FPS}"
+        f"scale={vid_w}:{vid_h}:force_original_aspect_ratio=increase,"
+        f"crop={vid_w}:{vid_h},"
+        f"zoompan=z='min(zoom+0.0006,1.15)':d={nframes}:s={vid_w}x{vid_h}:fps={FPS}"
     )
     cmd = [FFMPEG, "-y", "-loop", "1", "-i", str(img_path)]
     if wav_path is not None:
@@ -268,6 +290,8 @@ async def run_pipeline(req: StoryRequest):
         yield sse({"done": True})
         return
 
+    vid_w, vid_h, img_w, img_h = resolve_dims(req.aspect)
+
     work = Path(tempfile.mkdtemp(prefix="story_"))
     try:
         # ---- 3. voiceover per scene -----------------------------------------
@@ -300,7 +324,7 @@ async def run_pipeline(req: StoryRequest):
             scene_prompt = sc["image_prompt"]
             if req.style:
                 scene_prompt = f"{scene_prompt}. Art style: {req.style}"
-            data = await flux_scene(scene_prompt)
+            data = await flux_scene(scene_prompt, width=img_w, height=img_h)
             ip = work / f"scene_{i:02d}.png"
             if data:
                 ip.write_bytes(data)
@@ -320,7 +344,7 @@ async def run_pipeline(req: StoryRequest):
             dur = wav_duration(wp) if wp else NO_AUDIO_SCENE_SECS
             clip = work / f"clip_{i:02d}.mp4"
             try:
-                await loop.run_in_executor(None, render_scene_clip, ip, wp, clip, dur)
+                await loop.run_in_executor(None, render_scene_clip, ip, wp, clip, dur, vid_w, vid_h)
                 clips.append(clip)
             except subprocess.CalledProcessError as ex:
                 err = ex.stderr.decode()[-300:] if ex.stderr else str(ex)
